@@ -1,6 +1,6 @@
 [package]
 name = "sshmgmt"
-version = "0.1.0"
+version = "1.0.0"
 description = "SSH Tunnel Manager"
 authors = ["you"]
 edition = "2021"
