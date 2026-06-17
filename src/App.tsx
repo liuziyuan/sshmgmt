@@ -113,6 +113,13 @@ export default function App() {
           onDelete={handleDelete}
           onUploadKey={setUploadKeyId}
         />
+
+        <footer style={{
+          marginTop: 32, paddingTop: 16, borderTop: "1px solid #1f2937",
+          fontSize: 12, color: "#6b7280", lineHeight: 1.6,
+        }}>
+          ⚠ ssh 服务器用户名密码方案暂不支持，需要手动打通 ssh 的公钥上传方式，实现无密码连接。
+        </footer>
       </main>
 
       {showEditor && (

@@ -128,7 +128,7 @@ export default function TunnelList({
               )}
               <Btn onClick={() => onReconnect(t.config.id)} color="#f59e0b">重连</Btn>
               <Btn onClick={() => onEdit(t)} color="#8b5cf6">编辑</Btn>
-              <Btn onClick={() => onUploadKey(t.config.id)} color="#10b981">上传公钥</Btn>
+              <Btn onClick={() => onUploadKey(t.config.id)} color="#10b981" disabled title="暂不支持，请手动打通公钥免密">上传公钥</Btn>
               <Btn onClick={() => onDelete(t.config.id)} color="#ef4444">删除</Btn>
             </td>
           </tr>
@@ -139,18 +139,26 @@ export default function TunnelList({
 }
 
 function Btn({
-  onClick, children, color,
-}: { onClick: () => void; children: React.ReactNode; color: string }) {
+  onClick, children, color, disabled, title,
+}: {
+  onClick: () => void; children: React.ReactNode; color: string;
+  disabled?: boolean; title?: string;
+}) {
   return (
     <button
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
+      title={title}
       style={{
         marginRight: 4, padding: "3px 8px", fontSize: 12,
-        backgroundColor: "transparent", border: `1px solid ${color}`,
-        color, borderRadius: 4, cursor: "pointer",
+        backgroundColor: "transparent",
+        border: `1px solid ${disabled ? "#374151" : color}`,
+        color: disabled ? "#4b5563" : color, borderRadius: 4,
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.5 : 1,
       }}
-      onMouseEnter={(e) => { (e.target as HTMLButtonElement).style.backgroundColor = color + "22"; }}
-      onMouseLeave={(e) => { (e.target as HTMLButtonElement).style.backgroundColor = "transparent"; }}
+      onMouseEnter={(e) => { if (!disabled) (e.target as HTMLButtonElement).style.backgroundColor = color + "22"; }}
+      onMouseLeave={(e) => { if (!disabled) (e.target as HTMLButtonElement).style.backgroundColor = "transparent"; }}
     >
       {children}
     </button>
