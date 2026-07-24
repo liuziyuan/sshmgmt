@@ -189,14 +189,13 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function Overlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+export function Overlay({ children }: { children: React.ReactNode; onClose?: () => void }) {
   return (
     <div
       style={{
         position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.7)",
         display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
       }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div style={{
         backgroundColor: "#1e2433", borderRadius: 10, padding: 24,

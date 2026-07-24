@@ -58,7 +58,7 @@ pub fn run() {
             commands::reconnect_tunnel,
             commands::reconnect_all,
             commands::submit_password,
-            commands::upload_pubkey,
+            commands::list_public_keys,
             commands::delete_saved_password,
         ])
         .run(tauri::generate_context!())

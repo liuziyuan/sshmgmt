@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { TunnelInfo, TunnelState } from "../types";
 
 interface Props {
@@ -7,7 +8,6 @@ interface Props {
   onReconnect: (id: string) => void;
   onEdit: (info: TunnelInfo) => void;
   onDelete: (id: string) => void;
-  onUploadKey: (id: string) => void;
 }
 
 const STATE_COLOR: Record<string, string> = {
@@ -44,8 +44,9 @@ function Tag({ label, color }: { label: string; color: string }) {
 }
 
 export default function TunnelList({
-  tunnels, onConnect, onDisconnect, onReconnect, onEdit, onDelete, onUploadKey,
+  tunnels, onConnect, onDisconnect, onReconnect, onEdit, onDelete,
 }: Props) {
+  const [confirmId, setConfirmId] = useState<string | null>(null);
   if (tunnels.length === 0) {
     return (
       <div style={{ textAlign: "center", padding: "60px 0", color: "#6b7280" }}>
@@ -128,8 +129,14 @@ export default function TunnelList({
               )}
               <Btn onClick={() => onReconnect(t.config.id)} color="#f59e0b">重连</Btn>
               <Btn onClick={() => onEdit(t)} color="#8b5cf6">编辑</Btn>
-              <Btn onClick={() => onUploadKey(t.config.id)} color="#10b981" disabled title="暂不支持，请手动打通公钥免密">上传公钥</Btn>
-              <Btn onClick={() => onDelete(t.config.id)} color="#ef4444">删除</Btn>
+              {confirmId === t.config.id ? (
+                <>
+                  <Btn onClick={() => { onDelete(t.config.id); setConfirmId(null); }} color="#dc2626">确认删除</Btn>
+                  <Btn onClick={() => setConfirmId(null)} color="#6b7280">取消</Btn>
+                </>
+              ) : (
+                <Btn onClick={() => setConfirmId(t.config.id)} color="#ef4444">删除</Btn>
+              )}
             </td>
           </tr>
         ))}

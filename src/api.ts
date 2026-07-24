@@ -42,15 +42,21 @@ export const reconnectAll = (): Promise<void> => invoke("reconnect_all");
 export const submitPassword = (
   id: string,
   password: string,
-  save: boolean
-): Promise<void> => invoke("submit_password", { id, password, save });
+  save: boolean,
+  pubkeyPath: string | null,
+  username?: string,
+): Promise<void> =>
+  invoke("submit_password", { id, password, save, pubkeyPath, username });
 
-// ─── Public key ───────────────────────────────────────────────────────────────
+export interface PublicKeyInfo {
+  path: string;
+  name: string;
+  content: string;
+  has_private: boolean;
+}
 
-export const uploadPubkey = (
-  id: string,
-  pubkeyContent: string
-): Promise<void> => invoke("upload_pubkey", { id, pubkeyContent });
+export const listPublicKeys = (): Promise<PublicKeyInfo[]> =>
+  invoke("list_public_keys");
 
 export const deleteSavedPassword = (id: string): Promise<void> =>
   invoke("delete_saved_password", { id });
@@ -64,9 +70,28 @@ export const onStateChanged = (
     cb(e.payload)
   );
 
+export interface PasswordRequiredPayload {
+  id: string;
+  prompt: string;
+  layer: "jump" | "target";
+  host: string;
+  needUsername: boolean;
+}
+
 export const onPasswordRequired = (
-  cb: (payload: { id: string; prompt: string }) => void
+  cb: (payload: PasswordRequiredPayload) => void
 ): Promise<UnlistenFn> =>
-  listen<{ id: string; prompt: string }>("tunnel://password-required", (e) =>
+  listen<PasswordRequiredPayload>("tunnel://password-required", (e) =>
     cb(e.payload)
   );
+
+export interface NoticePayload {
+  id: string;
+  level: "success" | "warn" | "error";
+  message: string;
+}
+
+export const onNotice = (
+  cb: (payload: NoticePayload) => void
+): Promise<UnlistenFn> =>
+  listen<NoticePayload>("tunnel://notice", (e) => cb(e.payload));

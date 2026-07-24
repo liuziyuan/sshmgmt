@@ -155,88 +155,22 @@ pub async fn submit_password(
     id: String,
     password: String,
     save: bool,
+    username: Option<String>,
+    pubkey_path: Option<String>,
     mgr: State<'_, AppManager>,
 ) -> Result<(), String> {
     let m = mgr.lock().await;
-    if !m.submit_password(&id, password, save) {
+    if !m.submit_password(&id, password, save, username, pubkey_path) {
         return Err("No pending password request for this tunnel".into());
     }
     Ok(())
 }
 
-// ─── Public key upload ────────────────────────────────────────────────────────
-
-/// Upload a public key to the jump host's authorized_keys file.
-/// `pubkey_content` is the full text of the .pub file (e.g. "ssh-ed25519 AAAA... comment").
+/// List the local public keys under ~/.ssh so the user can pick which one to
+/// upload. Ordered ed25519 → ecdsa → rsa → others.
 #[tauri::command]
-pub async fn upload_pubkey(
-    id: String,
-    pubkey_content: String,
-    mgr: State<'_, AppManager>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let config = {
-        let m = mgr.lock().await;
-        m.get_config(&id)
-            .cloned()
-            .ok_or_else(|| "Tunnel not found".to_string())?
-    };
-
-    // Clone the shared state references
-    let password_senders = {
-        let m = mgr.lock().await;
-        m.password_senders.clone()
-    };
-
-    let pubkey_content = pubkey_content.trim().to_string();
-    if pubkey_content.is_empty() {
-        return Err("Public key content is empty".into());
-    }
-
-    // Open a fresh session for this one-shot operation
-    let session = tunnel::open_session(&config, &password_senders, &app)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Command: append key if not already present
-    let shell_cmd = format!(
-        r#"mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qxF '{key}' ~/.ssh/authorized_keys 2>/dev/null || echo '{key}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo OK"#,
-        key = pubkey_content.replace('\'', r"'\''")
-    );
-
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Cannot open session channel: {}", e))?;
-
-    channel
-        .exec(true, shell_cmd.as_str())
-        .await
-        .map_err(|e| format!("exec failed: {}", e))?;
-
-    // Read output to confirm
-    let mut stdout = Vec::new();
-    while let Some(msg) = channel.wait().await {
-        use russh::ChannelMsg;
-        match msg {
-            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            ChannelMsg::ExitStatus { exit_status } => {
-                if exit_status != 0 {
-                    return Err(format!("Remote command exited with status {}", exit_status));
-                }
-            }
-            ChannelMsg::Eof => break,
-            _ => {}
-        }
-    }
-
-    let output = String::from_utf8_lossy(&stdout);
-    if !output.trim().contains("OK") {
-        return Err(format!("Unexpected output: {}", output.trim()));
-    }
-
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "en").await;
-    Ok(())
+pub async fn list_public_keys() -> Result<Vec<crate::model::PublicKeyInfo>, String> {
+    Ok(tunnel::list_public_keys())
 }
 
 // ─── Keychain helpers ─────────────────────────────────────────────────────────

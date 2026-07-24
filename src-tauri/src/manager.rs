@@ -223,10 +223,22 @@ impl TunnelManager {
     }
 
     /// Deliver a password response to a waiting tunnel task.
-    pub fn submit_password(&self, id: &str, password: String, save: bool) -> bool {
+    pub fn submit_password(
+        &self,
+        id: &str,
+        password: String,
+        save: bool,
+        username: Option<String>,
+        pubkey_path: Option<String>,
+    ) -> bool {
         let mut senders = self.password_senders.lock().unwrap();
         if let Some(tx) = senders.remove(id) {
-            let _ = tx.send(PasswordResponse { password, save });
+            let _ = tx.send(PasswordResponse {
+                password,
+                save,
+                username,
+                pubkey_path,
+            });
             true
         } else {
             false

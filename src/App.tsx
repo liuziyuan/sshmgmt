@@ -2,23 +2,21 @@ import "./App.css";
 import { useState, useEffect, useCallback } from "react";
 import {
   listTunnels, connectTunnel, disconnectTunnel, reconnectTunnel,
-  reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired,
+  reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired, onNotice,
 } from "./api";
+import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
 import TunnelList from "./components/TunnelList";
 import TunnelEditor from "./components/TunnelEditor";
 import PasswordModal from "./components/PasswordModal";
-import UploadKeyModal from "./components/UploadKeyModal";
 
 export default function App() {
   const [tunnels, setTunnels] = useState<TunnelInfo[]>([]);
   const [showEditor, setShowEditor] = useState(false);
   const [editTarget, setEditTarget] = useState<TunnelInfo | null>(null);
-  const [pendingPassword, setPendingPassword] = useState<{
-    id: string; prompt: string;
-  } | null>(null);
-  const [uploadKeyId, setUploadKeyId] = useState<string | null>(null);
+  const [pendingPassword, setPendingPassword] = useState<PasswordRequiredPayload | null>(null);
   const [globalError, setGlobalError] = useState("");
+  const [notice, setNotice] = useState<{ level: NoticePayload["level"]; message: string } | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -35,15 +33,27 @@ export default function App() {
       setTunnels((prev) => prev.map((t) => t.config.id === id ? { ...t, state } : t));
     });
 
-    const unPw = onPasswordRequired(({ id, prompt }) => {
-      setPendingPassword({ id, prompt });
+    const unPw = onPasswordRequired((payload) => {
+      setPendingPassword(payload);
+    });
+
+    const unNotice = onNotice(({ level, message }) => {
+      setNotice({ level, message });
     });
 
     return () => {
       unState.then((fn) => fn());
       unPw.then((fn) => fn());
+      unNotice.then((fn) => fn());
     };
   }, [reload]);
+
+  // Auto-dismiss the transient notice banner after a few seconds.
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   const wrap = (fn: () => Promise<void>) => () =>
     fn().catch((e) => setGlobalError(String(e)));
@@ -54,14 +64,9 @@ export default function App() {
   const handleReconnectAll = wrap(reconnectAll);
 
   const handleDelete = async (id: string) => {
-    if (!confirm("确认删除这个隧道？")) return;
     try { await deleteTunnel(id); await reload(); }
     catch (e) { setGlobalError(String(e)); }
   };
-
-  const uploadKeyTunnel = uploadKeyId
-    ? tunnels.find((t) => t.config.id === uploadKeyId) ?? null
-    : null;
 
   return (
     <div style={{
@@ -103,6 +108,24 @@ export default function App() {
         </div>
       )}
 
+      {/* Notice banner (transient: success / warn) */}
+      {notice && (
+        <div style={{
+          backgroundColor: notice.level === "success" ? "#052e16" : "#422006",
+          borderBottom: `1px solid ${notice.level === "success" ? "#22c55e" : "#f59e0b"}`,
+          padding: "10px 24px", fontSize: 13,
+          color: notice.level === "success" ? "#86efac" : "#fcd34d",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+        }}>
+          <span>{notice.level === "success" ? "✅" : "⚠"} {notice.message}</span>
+          <button onClick={() => setNotice(null)}
+            style={{ background: "none", border: "none",
+              color: notice.level === "success" ? "#86efac" : "#fcd34d", cursor: "pointer" }}>
+            ✕
+          </button>
+        </div>
+      )}
+
       <main style={{ padding: "24px" }}>
         <TunnelList
           tunnels={tunnels}
@@ -111,14 +134,13 @@ export default function App() {
           onReconnect={handleReconnect}
           onEdit={(info) => { setEditTarget(info); setShowEditor(true); }}
           onDelete={handleDelete}
-          onUploadKey={setUploadKeyId}
         />
 
         <footer style={{
           marginTop: 32, paddingTop: 16, borderTop: "1px solid #1f2937",
           fontSize: 12, color: "#6b7280", lineHeight: 1.6,
         }}>
-          ⚠ ssh 服务器用户名密码方案暂不支持，需要手动打通 ssh 的公钥上传方式，实现无密码连接。
+          🔑 连接时若使用用户名密码，可勾选「连接后上传公钥」，下次自动免密连接。
         </footer>
       </main>
 
@@ -133,16 +155,8 @@ export default function App() {
 
       {pendingPassword && (
         <PasswordModal
-          id={pendingPassword.id}
-          prompt={pendingPassword.prompt}
+          request={pendingPassword}
           onClose={() => setPendingPassword(null)}
-        />
-      )}
-
-      {uploadKeyTunnel && (
-        <UploadKeyModal
-          tunnel={uploadKeyTunnel}
-          onClose={() => setUploadKeyId(null)}
         />
       )}
     </div>
