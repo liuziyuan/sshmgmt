@@ -1,15 +1,17 @@
 import { useState, useEffect } from "react";
 import { addTunnel, updateTunnel, parseCommand } from "../api";
 import type { TunnelConfig, TunnelInfo } from "../types";
+import type { Notify } from "../App";
 
 interface Props {
   editTarget: TunnelInfo | null; // null = add mode
   tunnels: TunnelInfo[];
+  notify: Notify;
   onClose: () => void;
   onSaved: () => void;
 }
 
-export default function TunnelEditor({ editTarget, tunnels, onClose, onSaved }: Props) {
+export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onSaved }: Props) {
   const isEdit = editTarget !== null;
 
   const [rawCommand, setRawCommand] = useState(
@@ -81,6 +83,7 @@ export default function TunnelEditor({ editTarget, tunnels, onClose, onSaved }: 
       onClose();
     } catch (e) {
       setSaveError(String(e));
+      notify("error", `保存隧道失败：${e}`);
     } finally {
       setSaving(false);
     }
@@ -189,14 +192,13 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function Overlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+export function Overlay({ children }: { children: React.ReactNode; onClose?: () => void }) {
   return (
     <div
       style={{
         position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.7)",
         display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
       }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div style={{
         backgroundColor: "#1e2433", borderRadius: 10, padding: 24,

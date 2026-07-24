@@ -65,3 +65,27 @@ pub fn delete_password(user: &str, host: &str, port: u16) -> Result<()> {
     entry.delete_credential()?;
     Ok(())
 }
+
+/// Account key for a remembered target-host username. Reserved prefix keeps it
+/// distinct from password entries (which use "user@host:port").
+fn target_user_account(host: &str, port: u16) -> String {
+    format!("__targetuser__@{}:{}", host, port)
+}
+
+/// The username that last authenticated successfully to a target host, if any.
+pub fn get_target_user(host: &str, port: u16) -> Option<String> {
+    let account = target_user_account(host, port);
+    match keyring::Entry::new(KEYRING_SERVICE, &account) {
+        Ok(entry) => entry.get_password().ok(),
+        Err(_) => None,
+    }
+}
+
+/// Remember the username that authenticated to a target host, so the next
+/// connection can attempt public-key auth without prompting.
+pub fn set_target_user(host: &str, port: u16, user: &str) -> Result<()> {
+    let account = target_user_account(host, port);
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)?;
+    entry.set_password(user)?;
+    Ok(())
+}

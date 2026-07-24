@@ -1,52 +1,98 @@
 import "./App.css";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   listTunnels, connectTunnel, disconnectTunnel, reconnectTunnel,
-  reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired,
+  reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired, onNotice,
 } from "./api";
+import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
 import TunnelList from "./components/TunnelList";
 import TunnelEditor from "./components/TunnelEditor";
 import PasswordModal from "./components/PasswordModal";
-import UploadKeyModal from "./components/UploadKeyModal";
+
+// ─── Banner (toast) feedback ───────────────────────────────────────────────────
+// error / warn banners are persistent — the user must click ✕ to dismiss them.
+// success banners auto-dismiss after a few seconds. Multiple banners stack
+// instead of overwriting each other, so no error goes unnoticed.
+export type BannerLevel = NoticePayload["level"];
+interface Banner {
+  id: number;
+  level: BannerLevel;
+  message: string;
+}
+export type Notify = (level: BannerLevel, message: string) => void;
+
+const AUTO_DISMISS_MS = 6000;
 
 export default function App() {
   const [tunnels, setTunnels] = useState<TunnelInfo[]>([]);
   const [showEditor, setShowEditor] = useState(false);
   const [editTarget, setEditTarget] = useState<TunnelInfo | null>(null);
-  const [pendingPassword, setPendingPassword] = useState<{
-    id: string; prompt: string;
-  } | null>(null);
-  const [uploadKeyId, setUploadKeyId] = useState<string | null>(null);
-  const [globalError, setGlobalError] = useState("");
+  const [pendingPassword, setPendingPassword] = useState<PasswordRequiredPayload | null>(null);
+  const [banners, setBanners] = useState<Banner[]>([]);
+  const bannerIdRef = useRef(0);
+
+  const dismissBanner = useCallback((id: number) => {
+    setBanners((prev) => prev.filter((b) => b.id !== id));
+  }, []);
+
+  const notify: Notify = useCallback((level, message) => {
+    const id = ++bannerIdRef.current;
+    setBanners((prev) => [...prev, { id, level, message }]);
+    if (level === "success") {
+      setTimeout(() => dismissBanner(id), AUTO_DISMISS_MS);
+    }
+  }, [dismissBanner]);
+
+  // Keep a ref mirror of `tunnels` so the state-changed listener (registered
+  // once) can look up a tunnel's display name without going stale.
+  const tunnelsRef = useRef<TunnelInfo[]>([]);
+  useEffect(() => { tunnelsRef.current = tunnels; }, [tunnels]);
+
+  // Track each tunnel's previous state type so we only pop a banner on the
+  // transition INTO "Failed" (not on every re-render / re-emit while it stays
+  // failed), and never on reconnect churn.
+  const prevStateRef = useRef<Map<string, string>>(new Map());
 
   const reload = useCallback(async () => {
     try {
       setTunnels(await listTunnels());
     } catch (e) {
-      setGlobalError(String(e));
+      notify("error", `加载隧道列表失败：${e}`);
     }
-  }, []);
+  }, [notify]);
 
   useEffect(() => {
     reload();
 
     const unState = onStateChanged(({ id, state }) => {
       setTunnels((prev) => prev.map((t) => t.config.id === id ? { ...t, state } : t));
+
+      const prevType = prevStateRef.current.get(id);
+      prevStateRef.current.set(id, state.type);
+      if (state.type === "Failed" && prevType !== "Failed") {
+        const name = tunnelsRef.current.find((t) => t.config.id === id)?.config.name ?? id;
+        notify("error", `隧道「${name}」连接失败：${state.message}`);
+      }
     });
 
-    const unPw = onPasswordRequired(({ id, prompt }) => {
-      setPendingPassword({ id, prompt });
+    const unPw = onPasswordRequired((payload) => {
+      setPendingPassword(payload);
+    });
+
+    const unNotice = onNotice(({ level, message }) => {
+      notify(level, message);
     });
 
     return () => {
       unState.then((fn) => fn());
       unPw.then((fn) => fn());
+      unNotice.then((fn) => fn());
     };
-  }, [reload]);
+  }, [reload, notify]);
 
   const wrap = (fn: () => Promise<void>) => () =>
-    fn().catch((e) => setGlobalError(String(e)));
+    fn().catch((e) => notify("error", String(e)));
 
   const handleConnect    = (id: string) => wrap(() => connectTunnel(id))();
   const handleDisconnect = (id: string) => wrap(() => disconnectTunnel(id))();
@@ -54,14 +100,21 @@ export default function App() {
   const handleReconnectAll = wrap(reconnectAll);
 
   const handleDelete = async (id: string) => {
-    if (!confirm("确认删除这个隧道？")) return;
     try { await deleteTunnel(id); await reload(); }
-    catch (e) { setGlobalError(String(e)); }
+    catch (e) { notify("error", `删除失败：${e}`); }
   };
 
-  const uploadKeyTunnel = uploadKeyId
-    ? tunnels.find((t) => t.config.id === uploadKeyId) ?? null
-    : null;
+  // User clicked ✕ / 取消 on the password prompt: give up on this login
+  // attempt entirely (disconnect the tunnel) rather than merely hiding the
+  // modal — otherwise the backend keeps waiting on the prompt (up to 5 min)
+  // and the tunnel is left stuck on yellow "Connecting" with no visible way
+  // to tell it's actually dead.
+  const handlePasswordCancel = () => {
+    if (!pendingPassword) return;
+    const { id } = pendingPassword;
+    setPendingPassword(null);
+    disconnectTunnel(id).catch((e) => notify("error", `取消连接失败：${e}`));
+  };
 
   return (
     <div style={{
@@ -88,20 +141,11 @@ export default function App() {
         </div>
       </header>
 
-      {/* Error banner */}
-      {globalError && (
-        <div style={{
-          backgroundColor: "#450a0a", borderBottom: "1px solid #ef4444",
-          padding: "10px 24px", fontSize: 13, color: "#fca5a5",
-          display: "flex", justifyContent: "space-between", alignItems: "center",
-        }}>
-          <span>⚠ {globalError}</span>
-          <button onClick={() => setGlobalError("")}
-            style={{ background: "none", border: "none", color: "#fca5a5", cursor: "pointer" }}>
-            ✕
-          </button>
-        </div>
-      )}
+      {/* Feedback banners: stack of error/warn (persistent, click ✕) and
+          success (auto-dismiss) — newest at the bottom. */}
+      {banners.map((b) => (
+        <Banner key={b.id} level={b.level} message={b.message} onClose={() => dismissBanner(b.id)} />
+      ))}
 
       <main style={{ padding: "24px" }}>
         <TunnelList
@@ -111,14 +155,13 @@ export default function App() {
           onReconnect={handleReconnect}
           onEdit={(info) => { setEditTarget(info); setShowEditor(true); }}
           onDelete={handleDelete}
-          onUploadKey={setUploadKeyId}
         />
 
         <footer style={{
           marginTop: 32, paddingTop: 16, borderTop: "1px solid #1f2937",
           fontSize: 12, color: "#6b7280", lineHeight: 1.6,
         }}>
-          ⚠ ssh 服务器用户名密码方案暂不支持，需要手动打通 ssh 的公钥上传方式，实现无密码连接。
+          🔑 连接时若使用用户名密码，可勾选「连接后上传公钥」，下次自动免密连接。
         </footer>
       </main>
 
@@ -126,6 +169,7 @@ export default function App() {
         <TunnelEditor
           editTarget={editTarget}
           tunnels={tunnels}
+          notify={notify}
           onClose={() => { setShowEditor(false); setEditTarget(null); }}
           onSaved={reload}
         />
@@ -133,18 +177,37 @@ export default function App() {
 
       {pendingPassword && (
         <PasswordModal
-          id={pendingPassword.id}
-          prompt={pendingPassword.prompt}
+          request={pendingPassword}
+          notify={notify}
           onClose={() => setPendingPassword(null)}
+          onCancel={handlePasswordCancel}
         />
       )}
+    </div>
+  );
+}
 
-      {uploadKeyTunnel && (
-        <UploadKeyModal
-          tunnel={uploadKeyTunnel}
-          onClose={() => setUploadKeyId(null)}
-        />
-      )}
+// ─── Feedback banner row ───────────────────────────────────────────────────────
+
+const BANNER_STYLE: Record<BannerLevel, { bg: string; border: string; fg: string; icon: string }> = {
+  error:   { bg: "#450a0a", border: "#ef4444", fg: "#fca5a5", icon: "⛔" },
+  warn:    { bg: "#422006", border: "#f59e0b", fg: "#fcd34d", icon: "⚠" },
+  success: { bg: "#052e16", border: "#22c55e", fg: "#86efac", icon: "✅" },
+};
+
+function Banner({ level, message, onClose }: { level: BannerLevel; message: string; onClose: () => void }) {
+  const s = BANNER_STYLE[level];
+  return (
+    <div style={{
+      backgroundColor: s.bg, borderBottom: `1px solid ${s.border}`,
+      padding: "10px 24px", fontSize: 13, color: s.fg,
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+    }}>
+      <span>{s.icon} {message}</span>
+      <button onClick={onClose}
+        style={{ background: "none", border: "none", color: s.fg, cursor: "pointer", fontSize: 14 }}>
+        ✕
+      </button>
     </div>
   );
 }

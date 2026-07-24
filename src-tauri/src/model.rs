@@ -49,8 +49,25 @@ pub struct TunnelInfo {
     pub state: TunnelState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicKeyInfo {
+    /// Absolute path to the .pub file
+    pub path: String,
+    /// File name only (e.g. "id_ed25519.pub")
+    pub name: String,
+    /// Full public key text (type base64 comment)
+    pub content: String,
+    /// Whether the paired private key exists next to it
+    pub has_private: bool,
+}
+
 #[derive(Debug)]
 pub struct PasswordResponse {
     pub password: String,
     pub save: bool,
+    /// Username entered by the user (second-layer target host login).
+    /// None for the jump host (username comes from config).
+    pub username: Option<String>,
+    /// Path to the local .pub file to upload after auth. None = don't upload.
+    pub pubkey_path: Option<String>,
 }
