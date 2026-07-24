@@ -1,14 +1,21 @@
 import { useState, useEffect } from "react";
 import { submitPassword, listPublicKeys } from "../api";
 import type { PasswordRequiredPayload, PublicKeyInfo } from "../api";
+import type { Notify } from "../App";
 import { Overlay } from "./TunnelEditor";
 
 interface Props {
   request: PasswordRequiredPayload;
+  notify: Notify;
   onClose: () => void;
+  /** User explicitly gave up on this login (✕ / 取消) — the tunnel connection
+   * attempt should be aborted, not just the modal hidden (otherwise the
+   * backend keeps waiting on this prompt up to its 5-minute timeout and the
+   * tunnel stays stuck yellow "Connecting" with no way to tell it's dead). */
+  onCancel: () => void;
 }
 
-export default function PasswordModal({ request, onClose }: Props) {
+export default function PasswordModal({ request, notify, onClose, onCancel }: Props) {
   const { id, prompt, layer, host, needUsername } = request;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -52,6 +59,7 @@ export default function PasswordModal({ request, onClose }: Props) {
       onClose();
     } catch (err) {
       setError(String(err));
+      notify("error", `提交密码失败：${err}`);
       setSubmitting(false);
     }
   };
@@ -163,7 +171,7 @@ export default function PasswordModal({ request, onClose }: Props) {
           <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
             <button
               type="button"
-              onClick={onClose}
+              onClick={onCancel}
               style={{
                 padding: "8px 16px", backgroundColor: "transparent", color: "#9ca3af",
                 border: "1px solid #374151", borderRadius: 6, cursor: "pointer", fontSize: 14,

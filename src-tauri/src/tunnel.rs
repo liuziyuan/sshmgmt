@@ -187,107 +187,33 @@ async fn connect_and_forward(
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
 ) -> Result<(), ConnectError> {
-    let ssh_config = Arc::new(russh::client::Config {
-        keepalive_interval: Some(Duration::from_secs(15)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
-
-    // Phase 1: connect and try local key files only, on their own connection.
-    // Some servers (esp. AD/Kerberos-integrated jump hosts) set a very low
-    // MaxAuthTries; russh's RSA retry-with-multiple-signature-hashes (see
-    // try_publickey_auth) alone can burn through that budget, and if we then
-    // continued on the SAME connection the password attempt below would never
-    // even get a chance — the server would have already disconnected us.
-    let (mut session, mut disconnect_rx) = connect_jump_host(ssh_config.clone(), config).await?;
-
-    let mut pubkey_authed = false;
-    for key_path in key_paths(config.identity_file.as_deref()) {
-        let p = std::path::Path::new(&key_path);
-        if !p.exists() {
-            continue;
-        }
-        match russh_keys::load_secret_key(p, None) {
-            Ok(kp) => {
-                if try_publickey_auth(&mut session, &config.jump_user, kp, &key_path, "jump")
-                    .await
-                    .map_err(ConnectError::Retriable)?
-                {
-                    pubkey_authed = true;
-                    break;
+    // Establishing the session (TCP connect, jump-host key/password auth, and
+    // any second-layer target-host auth) can block for a long time — most
+    // notably the password/keyboard-interactive prompt, which waits up to 5
+    // minutes for the user. Nothing inside `establish_session` polls
+    // `control_rx`, so without racing it here a Stop/Reconnect sent while the
+    // tunnel is still "Connecting" (yellow) would just sit in the channel and
+    // only take effect once the connection attempt happened to finish or
+    // time out — the Disconnect button would appear to do nothing. Racing
+    // establishment against `control_rx` makes Stop/Reconnect take effect
+    // immediately at any point up through "Connected".
+    let (session, disconnect_rx) = tokio::select! {
+        res = establish_session(config, password_senders, app) => res?,
+        ctrl = control_rx.recv() => {
+            // Abort: `establish_session`'s future (and everything it was
+            // awaiting — the TCP connect, an SSH session, a password wait)
+            // is dropped right here. Also clear any pending password prompt
+            // for this tunnel so a still-open modal isn't left waiting on a
+            // channel nobody will ever answer.
+            password_senders.lock().unwrap().remove(&config.id);
+            return match ctrl {
+                Some(TunnelControl::Stop) | None => Ok(()),
+                Some(TunnelControl::Reconnect) => {
+                    Err(ConnectError::Retriable(anyhow!("Reconnect requested")))
                 }
-            }
-            Err(e) => tracing::debug!("Cannot load key {}: {}", key_path, e),
+            };
         }
-    }
-
-    let outcome = if pubkey_authed {
-        AuthOutcome { authed: true, pubkey_uploaded: None }
-    } else {
-        // Phase 2: reconnect with a brand new TCP+SSH handshake before trying
-        // password / keyboard-interactive auth. Whether phase 1 merely
-        // refused every key or was disconnected outright by the server, this
-        // guarantees the password attempt gets a clean MaxAuthTries budget —
-        // exactly like running a second, separate `ssh` invocation would.
-        let (session2, disconnect_rx2) = connect_jump_host(ssh_config, config).await?;
-        session = session2;
-        disconnect_rx = disconnect_rx2;
-
-        password_phase(
-            &mut session,
-            Some(config.jump_user.as_str()),
-            &config.jump_host,
-            config.jump_port,
-            "jump",
-            &config.id,
-            password_senders,
-            app,
-        )
-        .await
-        .map_err(ConnectError::Retriable)?
     };
-
-    if !outcome.authed {
-        // Wrong jump credentials — stop, don't loop the password prompt.
-        return Err(ConnectError::Fatal(format!(
-            "跳板机 {}@{} 认证失败（用户名或密码错误）",
-            config.jump_user, config.jump_host
-        )));
-    }
-    if outcome.pubkey_uploaded == Some(true) {
-        emit_notice(app, &config.id, "success",
-            &format!("已上传公钥到跳板机 {}，下次免密连接", config.jump_host));
-    } else if outcome.pubkey_uploaded == Some(false) {
-        emit_notice(app, &config.id, "warn",
-            &format!("公钥上传到跳板机 {} 失败（密码仍可用）", config.jump_host));
-    }
-
-    // Second layer: every forward whose target is an SSH host (:22) MUST
-    // authenticate — green means both hops are truly established. A failure here
-    // is fatal (red, no reconnect). This is a connection-time action only; data
-    // forwarding below still goes over the single-hop direct-tcpip path.
-    for forward in &config.forwards {
-        if forward.remote_port != 22 {
-            continue;
-        }
-        let outcome = setup_second_layer(&session, forward, &config.id, password_senders, app).await?;
-        if !outcome.authed {
-            let _ = session
-                .disconnect(russh::Disconnect::ByApplication, "", "en")
-                .await;
-            return Err(ConnectError::Fatal(format!(
-                "目标主机 {} 认证失败（用户名或密码错误）",
-                forward.remote_host
-            )));
-        }
-        if outcome.pubkey_uploaded == Some(true) {
-            emit_notice(app, &config.id, "success",
-                &format!("已上传公钥到目标主机 {}，下次免密连接", forward.remote_host));
-        } else if outcome.pubkey_uploaded == Some(false) {
-            emit_notice(app, &config.id, "warn",
-                &format!("公钥上传到目标主机 {} 失败（密码仍可用）", forward.remote_host));
-        }
-    }
 
     // Both hops verified — now green.
     update_state(state_map, &config.id, TunnelState::Connected);
@@ -381,6 +307,132 @@ async fn connect_and_forward(
     result
 }
 
+/// Connect and fully authenticate both SSH hops — the jump host (key files,
+/// then password/keyboard-interactive on a fresh connection), and, for any
+/// forward whose target is `:22`, a second-layer login to that target host
+/// through the jump. Returns the authenticated jump-host session, ready for
+/// port forwarding.
+///
+/// Deliberately does NOT touch `state_map` / emit `Connected` — the caller
+/// (`connect_and_forward`) only does that once this future has actually won
+/// its race against `control_rx` (see there for why that race exists).
+async fn establish_session(
+    config: &TunnelConfig,
+    password_senders: &PasswordSenders,
+    app: &tauri::AppHandle,
+) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
+    let ssh_config = Arc::new(russh::client::Config {
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
+
+    // Phase 1: connect and try local key files only, on their own connection.
+    // Some servers (esp. AD/Kerberos-integrated jump hosts) set a very low
+    // MaxAuthTries; russh's RSA retry-with-multiple-signature-hashes (see
+    // try_publickey_auth) alone can burn through that budget, and if we then
+    // continued on the SAME connection the password attempt below would never
+    // even get a chance — the server would have already disconnected us.
+    let (mut session, mut disconnect_rx) = connect_jump_host(ssh_config.clone(), config).await?;
+
+    let mut pubkey_authed = false;
+    for key_path in key_paths(config.identity_file.as_deref()) {
+        let p = std::path::Path::new(&key_path);
+        if !p.exists() {
+            continue;
+        }
+        match russh_keys::load_secret_key(p, None) {
+            Ok(kp) => {
+                if try_publickey_auth(&mut session, &config.jump_user, kp, &key_path, "jump")
+                    .await
+                    .map_err(ConnectError::Retriable)?
+                {
+                    pubkey_authed = true;
+                    break;
+                }
+            }
+            Err(e) => tracing::debug!("Cannot load key {}: {}", key_path, e),
+        }
+    }
+
+    let outcome = if pubkey_authed {
+        AuthOutcome { authed: true, pubkey_uploaded: None }
+    } else {
+        // Phase 2: reconnect with a brand new TCP+SSH handshake before trying
+        // password / keyboard-interactive auth. Whether phase 1 merely
+        // refused every key or was disconnected outright by the server, this
+        // guarantees the password attempt gets a clean MaxAuthTries budget —
+        // exactly like running a second, separate `ssh` invocation would.
+        let (session2, disconnect_rx2) = connect_jump_host(ssh_config, config).await?;
+        session = session2;
+        disconnect_rx = disconnect_rx2;
+
+        password_phase(
+            &mut session,
+            Some(config.jump_user.as_str()),
+            &config.jump_host,
+            config.jump_port,
+            "jump",
+            &config.id,
+            password_senders,
+            app,
+        )
+        .await
+        .map_err(ConnectError::Retriable)?
+    };
+
+    if !outcome.authed {
+        // Wrong jump credentials — stop, don't loop the password prompt.
+        return Err(ConnectError::Fatal(format!(
+            "跳板机 {}@{} 认证失败（用户名或密码错误）",
+            config.jump_user, config.jump_host
+        )));
+    }
+    if outcome.pubkey_uploaded == Some(true) {
+        emit_notice(app, &config.id, "success",
+            &format!("已上传公钥到跳板机 {}，下次免密连接", config.jump_host));
+    } else if outcome.pubkey_uploaded == Some(false) {
+        emit_notice(app, &config.id, "warn",
+            &format!("公钥上传到跳板机 {} 失败（密码仍可用）", config.jump_host));
+    }
+
+    // Second layer: every forward whose target is an SSH host (:22) MUST
+    // authenticate — green means both hops are truly established. A failure here
+    // is fatal (red, no reconnect). This is a connection-time action only; data
+    // forwarding below still goes over the single-hop direct-tcpip path.
+    for forward in &config.forwards {
+        if forward.remote_port != 22 {
+            continue;
+        }
+        let outcome = setup_second_layer(&session, config, forward, password_senders, app).await?;
+        if !outcome.authed {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            return Err(ConnectError::Fatal(format!(
+                "目标主机 {} 认证失败（用户名或密码错误）",
+                forward.remote_host
+            )));
+        }
+        if outcome.pubkey_uploaded == Some(true) {
+            emit_notice(app, &config.id, "success",
+                &format!("已上传公钥到目标主机 {}，下次免密连接", forward.remote_host));
+        } else if outcome.pubkey_uploaded == Some(false) {
+            emit_notice(app, &config.id, "warn",
+                &format!("公钥上传到目标主机 {} 失败（密码仍可用）", forward.remote_host));
+        }
+    }
+
+    Ok((session, disconnect_rx))
+}
+
+/// Max time to wait for the initial TCP+SSH handshake to the jump host.
+/// Without this, an unreachable/black-holed jump host would leave the tunnel
+/// stuck on "Connecting" (yellow) indefinitely instead of failing/retrying —
+/// the two-phase auth race in `connect_and_forward` still lets the user
+/// disconnect manually while stuck, but this avoids relying on that.
+const JUMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Open a fresh TCP+SSH connection to the jump host. Called once for the
 /// key-based auth attempt and, on a separate call, for the password /
 /// keyboard-interactive attempt — each connection gets its own MaxAuthTries
@@ -394,13 +446,22 @@ async fn connect_jump_host(
     let handler = SshClientHandler {
         disconnect_tx: Some(disconnect_tx),
     };
-    let session = russh::client::connect(
+    let connect_fut = russh::client::connect(
         ssh_config,
         (config.jump_host.as_str(), config.jump_port),
         handler,
-    )
-    .await
-    .map_err(|e| ConnectError::Retriable(anyhow!("SSH connect failed: {}", e)))?;
+    );
+    let session = tokio::time::timeout(JUMP_CONNECT_TIMEOUT, connect_fut)
+        .await
+        .map_err(|_| {
+            ConnectError::Retriable(anyhow!(
+                "连接跳板机 {}:{} 超时（{}s）",
+                config.jump_host,
+                config.jump_port,
+                JUMP_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| ConnectError::Retriable(anyhow!("SSH connect failed: {}", e)))?;
     Ok((session, disconnect_rx))
 }
 
@@ -579,6 +640,11 @@ async fn password_phase(
                 if resp.save {
                     let _ = store::set_password(&effective_user, host, port, &resp.password);
                 }
+                // Target host (username was prompted): remember the username so
+                // the next connection can attempt public-key auth without a prompt.
+                if need_username {
+                    let _ = store::set_target_user(host, port, &effective_user);
+                }
                 let mut uploaded: Option<bool> = None;
                 if let Some(pub_path) = resp.pubkey_path.as_deref() {
                     match read_pubkey_file(pub_path) {
@@ -613,34 +679,93 @@ async fn password_phase(
 /// Establish a one-shot second-layer SSH session to the target host through the
 /// jump host, authenticate, and optionally upload the public key. The session is
 /// closed immediately — data forwarding stays on the single-hop direct-tcpip path.
+///
+/// Auth strategy mirrors the jump host: try local private keys first (on their
+/// own connection, so a low MaxAuthTries can't starve the password attempt), and
+/// only fall back to a password prompt on a fresh connection if every key fails.
+/// The public-key attempt needs a username; we use the remembered one (from a
+/// prior successful login) or derive a default from the jump username by
+/// stripping the "@domain" realm (e.g. "liu.zy@pg.com" → "liu.zy").
 async fn setup_second_layer(
     jump: &russh::client::Handle<SshClientHandler>,
+    config: &TunnelConfig,
     forward: &crate::model::ForwardSpec,
-    id: &str,
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
 ) -> Result<AuthOutcome, ConnectError> {
-    // Open a direct-tcpip channel from the jump host to target:22.
-    let channel = jump
-        .channel_open_direct_tcpip(&forward.remote_host, forward.remote_port as u32, "127.0.0.1", 0)
-        .await
-        .map_err(|e| ConnectError::Retriable(anyhow!("open channel to {}:22 failed: {}", forward.remote_host, e)))?;
-    let stream = channel.into_stream();
+    let id = &config.id;
+    let host = &forward.remote_host;
+    let port = forward.remote_port;
 
-    let ssh_config = Arc::new(russh::client::Config::default());
-    let (tx, _rx) = oneshot::channel::<()>();
-    let handler = SshClientHandler { disconnect_tx: Some(tx) };
+    // Open a fresh SSH session to target:port over a new direct-tcpip channel.
+    // Each call gets its own MaxAuthTries budget, just like the jump-host phases.
+    async fn open_target_session(
+        jump: &russh::client::Handle<SshClientHandler>,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::client::Handle<SshClientHandler>, ConnectError> {
+        let channel = jump
+            .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|e| ConnectError::Retriable(anyhow!("open channel to {}:{} failed: {}", host, port, e)))?;
+        let stream = channel.into_stream();
+        let ssh_config = Arc::new(russh::client::Config::default());
+        let (tx, _rx) = oneshot::channel::<()>();
+        let handler = SshClientHandler { disconnect_tx: Some(tx) };
+        russh::client::connect_stream(ssh_config, stream, handler)
+            .await
+            .map_err(|e| ConnectError::Retriable(anyhow!("second-layer SSH connect failed: {}", e)))
+    }
 
-    let mut session = russh::client::connect_stream(ssh_config, stream, handler)
-        .await
-        .map_err(|e| ConnectError::Retriable(anyhow!("second-layer SSH connect failed: {}", e)))?;
+    // Candidate username for the pubkey attempt: remembered first, else derived
+    // from the jump username by stripping the "@domain" realm.
+    let candidate_user = store::get_target_user(host, port).or_else(|| {
+        let ju = config.jump_user.as_str();
+        let derived = ju.rsplit_once('@').map(|(u, _)| u).unwrap_or(ju);
+        if derived.is_empty() { None } else { Some(derived.to_string()) }
+    });
 
+    // Phase 1: public-key auth on its own connection.
+    if let Some(user) = candidate_user {
+        let mut session = open_target_session(jump, host, port).await?;
+        let mut pubkey_authed = false;
+        for key_path in key_paths(config.identity_file.as_deref()) {
+            let p = std::path::Path::new(&key_path);
+            if !p.exists() {
+                continue;
+            }
+            match russh_keys::load_secret_key(p, None) {
+                Ok(kp) => {
+                    if try_publickey_auth(&mut session, &user, kp, &key_path, "target")
+                        .await
+                        .map_err(ConnectError::Retriable)?
+                    {
+                        pubkey_authed = true;
+                        break;
+                    }
+                }
+                Err(e) => tracing::debug!("Cannot load key {}: {}", key_path, e),
+            }
+        }
+        if pubkey_authed {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            return Ok(AuthOutcome { authed: true, pubkey_uploaded: None });
+        }
+        let _ = session
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+    }
+
+    // Phase 2: password prompt on a brand-new connection (clean auth budget).
     // Username unknown → prompt (need_username=true). Port fixed at 22.
+    let mut session = open_target_session(jump, host, port).await?;
     let outcome = password_phase(
         &mut session,
         None,
-        &forward.remote_host,
-        forward.remote_port,
+        host,
+        port,
         "target",
         id,
         password_senders,
