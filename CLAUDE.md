@@ -65,6 +65,8 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 
 ## 发布 / 版本号
 
+> ⚠️ **合并 PR / 推送到 `main` 完全不会触发发布！** `.github/workflows/release.yml` 只在 `push: tags: 'v*'` 时才会跑。**打 tag 是发布流程里唯一不能忘的一步**——历史上真实发生过：PR 合并进 `main` 后没人记得打 tag，导致 GitHub Actions 从未运行、Releases 页面只留了个永远没人点 Publish 的旧草稿。**只要涉及"合并 PR / 版本升级"，无论用户有没有在这次对话里明确提到"打 tag"，都要主动打 tag 并推送**，或者至少主动提醒用户"要不要现在打 tag 发布"——不要默认合并完就算完事。
+
 版本号存在 **4 个地方**，升级时必须同时改（否则安装包版本号和 tag 对不上）：
 
 1. `package.json`（可用 `npm version <major|minor|patch> --no-git-tag-version` 一次性改好 package.json + package-lock.json）
@@ -74,7 +76,15 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 
 改完 `Cargo.toml` 后跑一次 `cargo build`，让 `Cargo.lock` 里 `name = "sshmgmt"` 对应的 `version` 自动同步。
 
-发布流程：提交 → `git tag vX.Y.Z && git push origin vX.Y.Z` → GitHub Actions（`.github/workflows/release.yml`）在 macOS/Windows/Linux 上构建，产物进草稿 Release，人工确认后 Publish。
+### 完整发布流程（按顺序，最后一步不能省）
+
+1. 改 4 处版本号（见上）。
+2. 提交、push 分支、开 PR（`gh pr create`）。
+3. PR 合并进 `main`（`gh pr merge` 或用户在 GitHub 上手动合并）。
+4. 本地 `git checkout main && git pull`，确认 `main` 已包含合并后的提交。
+5. **`git tag vX.Y.Z && git push origin vX.Y.Z`** ← 真正触发发布的唯一步骤，tag 版本号要和第 1 步的 4 处版本号一致。
+6. GitHub Actions 在 macOS（arm64 + x64）/ Windows / Linux 上构建，产物自动进一个**草稿** Release（`gh run view <run-id>` 或 Actions 页面看进度）。
+7. 人工去 [Releases 页面](https://github.com/liuziyuan/sshmgmt/releases) 确认草稿内容后点 **Publish**，才算真正对外发布。workflow 不会自动帮你点这一步。
 
 ## 其他约定
 
