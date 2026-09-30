@@ -92,6 +92,19 @@ export const pickImportPath = (): Promise<string | null> =>
     filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
   }) as Promise<string | null>;
 
+// ─── Group ordering ──────────────────────────────────────────────────────────
+
+export const getGroupOrder = (): Promise<string[]> => invoke("get_group_order");
+
+export const setGroupOrder = (order: string[]): Promise<void> =>
+  invoke("set_group_order", { order });
+
+export const getCollapsedGroups = (): Promise<string[]> =>
+  invoke("get_collapsed_groups");
+
+export const setCollapsedGroups = (groups: string[]): Promise<void> =>
+  invoke("set_collapsed_groups", { groups });
+
 // ─── Events ───────────────────────────────────────────────────────────────────
 
 export const onStateChanged = (

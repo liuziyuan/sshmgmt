@@ -36,6 +36,10 @@ pub struct ExportFile {
     pub version: u32,
     pub exported_at: u64,
     pub tunnels: Vec<ExportedTunnel>,
+    /// Saved group display order. Optional (older export files lack it);
+    /// absent means "no custom ordering".
+    #[serde(default)]
+    pub group_order: Option<Vec<String>>,
 }
 
 /// Assemble the export payload, pulling secrets from the keychain.
@@ -61,6 +65,10 @@ pub fn build_export(tunnels: &[TunnelConfig]) -> ExportFile {
         version: EXPORT_VERSION,
         exported_at,
         tunnels,
+        group_order: {
+            let order = store::load_group_order();
+            if order.is_empty() { None } else { Some(order) }
+        },
     }
 }
 
@@ -211,11 +219,30 @@ mod tests {
         assert_eq!(file.tunnels.len(), 1);
         assert!(file.tunnels[0].secret.password.is_none());
         assert!(file.tunnels[0].secret.target_user.is_none());
+        // group_order is optional and defaults to None on older files.
+        assert!(file.group_order.is_none());
 
         // Round-trip: serialize back and re-parse.
         let back: ExportFile = serde_json::from_str(&serde_json::to_string(&file).unwrap())
             .unwrap();
         assert_eq!(back.tunnels[0].config.id, "a");
+    }
+
+    #[test]
+    fn export_file_roundtrips_with_group_order() {
+        let json = r#"{
+            "format": "sshmgmt-tunnels",
+            "version": 1,
+            "exported_at": 1759180800,
+            "tunnels": [],
+            "group_order": ["GI", "CD"]
+        }"#;
+        let file: ExportFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.group_order, Some(vec!["GI".to_string(), "CD".to_string()]));
+
+        let back: ExportFile = serde_json::from_str(&serde_json::to_string(&file).unwrap())
+            .unwrap();
+        assert_eq!(back.group_order, Some(vec!["GI".to_string(), "CD".to_string()]));
     }
 
     #[test]

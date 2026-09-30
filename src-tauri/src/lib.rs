@@ -9,6 +9,7 @@ mod tunnel;
 
 use commands::AppManager;
 use manager::TunnelManager;
+use model::TunnelConfig;
 use store::load_tunnels;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -26,7 +27,8 @@ pub fn run() {
         )
         .init();
 
-    let tunnels = load_tunnels();
+    let mut tunnels = load_tunnels();
+    migrate_env_case(&mut tunnels);
     let manager = TunnelManager::new(tunnels);
 
     tauri::Builder::default()
@@ -64,9 +66,40 @@ pub fn run() {
             commands::delete_saved_password,
             commands::export_tunnels,
             commands::import_tunnels,
+            commands::get_group_order,
+            commands::set_group_order,
+            commands::get_collapsed_groups,
+            commands::set_collapsed_groups,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ─── 一次性数据迁移 ────────────────────────────────────────────────────────────
+
+// One-time migration: fold legacy lowercase environment names ("qa"/"prod")
+// into their uppercase form so they merge with existing entries. Idempotent —
+// nothing is written when every environment is already uppercase.
+fn migrate_env_case(tunnels: &mut Vec<TunnelConfig>) {
+    let mut changed = false;
+    for c in tunnels.iter_mut() {
+        if let Some(env) = &c.environment {
+            let up = env.trim().to_uppercase();
+            if !up.is_empty() && env != &up {
+                c.environment = Some(up);
+                changed = true;
+            } else if up.is_empty() {
+                // An empty/whitespace environment is the same as "not set".
+                c.environment = None;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Err(e) = store::save_tunnels(tunnels) {
+            tracing::warn!("env case migration failed: {}", e);
+        }
+    }
 }
 
 // ─── 系统托盘 ──────────────────────────────────────────────────────────────────

@@ -4,6 +4,8 @@ import {
   listTunnels, connectTunnel, disconnectTunnel, reconnectTunnel,
   reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired, onNotice,
   exportTunnels, importTunnels, pickExportPath, pickImportPath,
+  getGroupOrder, setGroupOrder as setGroupOrderAPI,
+  getCollapsedGroups, setCollapsedGroups as setCollapsedGroupsAPI,
 } from "./api";
 import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
@@ -31,6 +33,8 @@ export default function App() {
   const [editTarget, setEditTarget] = useState<TunnelInfo | null>(null);
   const [pendingPassword, setPendingPassword] = useState<PasswordRequiredPayload | null>(null);
   const [banners, setBanners] = useState<Banner[]>([]);
+  const [groupOrder, setGroupOrder] = useState<string[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const bannerIdRef = useRef(0);
 
   const dismissBanner = useCallback((id: number) => {
@@ -60,6 +64,16 @@ export default function App() {
       setTunnels(await listTunnels());
     } catch (e) {
       notify("error", `加载隧道列表失败：${e}`);
+    }
+    try {
+      setGroupOrder(await getGroupOrder());
+    } catch (e) {
+      notify("error", `加载分组顺序失败：${e}`);
+    }
+    try {
+      setCollapsedGroups(await getCollapsedGroups());
+    } catch (e) {
+      notify("error", `加载分组折叠状态失败：${e}`);
     }
   }, [notify]);
 
@@ -145,6 +159,22 @@ export default function App() {
     }
   };
 
+  // Group drag reorder: update locally for instant feedback, persist in the
+  // background; a persistence failure leaves the local order in place and
+  // just surfaces a banner (the next app start reloads the saved order).
+  const handleGroupOrderChange = (order: string[]) => {
+    setGroupOrder(order);
+    setGroupOrderAPI(order).catch((e) => notify("error", `保存分组顺序失败：${e}`));
+  };
+
+  // Collapse state is likewise local-first, persisted in the background.
+  const handleCollapsedChange = (groups: string[]) => {
+    setCollapsedGroups(groups);
+    setCollapsedGroupsAPI(groups).catch((e) =>
+      notify("error", `保存分组折叠状态失败：${e}`)
+    );
+  };
+
   // User clicked ✕ / 取消 on the password prompt: give up on this login
   // attempt entirely (disconnect the tunnel) rather than merely hiding the
   // modal — otherwise the backend keeps waiting on the prompt (up to 5 min)
@@ -197,6 +227,10 @@ export default function App() {
       <main style={{ padding: "24px" }}>
         <TunnelList
           tunnels={tunnels}
+          groupOrder={groupOrder}
+          onGroupOrderChange={handleGroupOrderChange}
+          collapsedGroups={collapsedGroups}
+          onCollapsedChange={handleCollapsedChange}
           onConnect={handleConnect}
           onDisconnect={handleDisconnect}
           onReconnect={handleReconnect}

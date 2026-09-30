@@ -12,6 +12,17 @@ use crate::tunnel;
 
 pub type AppManager = TokioMutex<TunnelManager>;
 
+// Environment names are case-normalized to uppercase so "qa" and "QA" can
+// never become two separate environments. An empty/whitespace value means
+// "not set".
+fn normalize_env(env: Option<String>) -> Option<String> {
+    env.map(|e| {
+        let t = e.trim();
+        if t.is_empty() { None } else { Some(t.to_uppercase()) }
+    })
+    .flatten()
+}
+
 // ─── Query ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -35,8 +46,8 @@ pub async fn add_tunnel(
     mgr: State<'_, AppManager>,
 ) -> Result<TunnelConfig, String> {
     let mut config = parse_ssh_command(&raw_command, name).map_err(|e| e.to_string())?;
-    config.group = group;
-    config.environment = environment;
+    config.group = group.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+    config.environment = normalize_env(environment);
     let mut m = mgr.lock().await;
     m.add_config(config.clone());
     store::save_tunnels(m.configs()).map_err(|e| e.to_string())?;
@@ -49,6 +60,11 @@ pub async fn update_tunnel(
     mgr: State<'_, AppManager>,
 ) -> Result<(), String> {
     let mut m = mgr.lock().await;
+    // Normalize user-supplied fields the same way add_tunnel does, so an edit
+    // can't reintroduce a lowercase environment or an untrimmed group.
+    let mut config = config;
+    config.group = config.group.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+    config.environment = normalize_env(config.environment);
     if !m.update_config(config) {
         return Err("Tunnel not found".into());
     }
@@ -186,11 +202,15 @@ pub async fn import_tunnels(
 ) -> Result<ImportSummary, String> {
     let file = transfer::read_import(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
     let mut m = mgr.lock().await;
-    let (to_import, skipped) = transfer::split_new(m.configs(), &file.tunnels);
+    let (mut to_import, skipped) = transfer::split_new(m.configs(), &file.tunnels);
 
     let mut warnings = Vec::new();
-    for t in &to_import {
-        let c = &t.config;
+    for t in &mut to_import {
+        let c = &mut t.config;
+        // Imported files may predate env normalization — fold them in here
+        // too, so an old export can't reintroduce "qa"/"prod" entries.
+        c.environment = normalize_env(c.environment.clone());
+        c.group = c.group.clone().map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
         // Only write Some secrets — null means "not exported", never "delete".
         if let Some(pw) = &t.secret.password {
             if let Err(e) = store::set_password(&c.jump_user, &c.jump_host, c.jump_port, pw) {
@@ -207,12 +227,40 @@ pub async fn import_tunnels(
     if !to_import.is_empty() {
         store::save_tunnels(m.configs()).map_err(|e| e.to_string())?;
     }
+    // Bring the group ordering along too when the export file carries it.
+    if let Some(order) = &file.group_order {
+        if !order.is_empty() {
+            store::save_group_order(order).map_err(|e| e.to_string())?;
+        }
+    }
     Ok(ImportSummary {
         imported: to_import.len(),
         skipped: skipped.len(),
         skipped_names: skipped.iter().map(|t| t.config.name.clone()).collect(),
         warnings,
     })
+}
+
+// ─── Group ordering ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_group_order() -> Result<Vec<String>, String> {
+    Ok(store::load_group_order())
+}
+
+#[tauri::command]
+pub async fn set_group_order(order: Vec<String>) -> Result<(), String> {
+    store::save_group_order(&order).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_collapsed_groups() -> Result<Vec<String>, String> {
+    Ok(store::load_collapsed_groups())
+}
+
+#[tauri::command]
+pub async fn set_collapsed_groups(groups: Vec<String>) -> Result<(), String> {
+    store::save_collapsed_groups(&groups).map_err(|e| e.to_string())
 }
 
 // ─── Password ─────────────────────────────────────────────────────────────────
