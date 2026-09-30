@@ -1,3 +1,4 @@
+use serde::Serialize;
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -6,6 +7,7 @@ use crate::manager::TunnelManager;
 use crate::parser::parse_ssh_command;
 use crate::probe::{self, PortStatus};
 use crate::store;
+use crate::transfer;
 use crate::tunnel;
 
 pub type AppManager = TokioMutex<TunnelManager>;
@@ -146,6 +148,71 @@ pub async fn reconnect_all(
 ) -> Result<(), String> {
     mgr.lock().await.reconnect_all(&app);
     Ok(())
+}
+
+// ─── Import / Export ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ImportSummary {
+    pub imported: usize,
+    pub skipped: usize,
+    pub skipped_names: Vec<String>,
+    /// Non-fatal keychain write failures (configs were still imported).
+    pub warnings: Vec<String>,
+}
+
+/// Write every tunnel config (plus keychain secrets, plaintext) to `path`.
+/// The path comes from the frontend dialog plugin; the file never touches JS.
+#[tauri::command]
+pub async fn export_tunnels(
+    path: String,
+    mgr: State<'_, AppManager>,
+) -> Result<usize, String> {
+    let m = mgr.lock().await;
+    let file = transfer::build_export(m.configs());
+    let count = file.tunnels.len();
+    transfer::write_export(std::path::Path::new(&path), &file).map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
+/// Merge tunnels from an export file into the local list. Conflicting tunnels
+/// (same id or name) are skipped entirely — including their secrets, so a
+/// local keychain entry is never overwritten by an import. Keychain write
+/// failures are collected into `warnings` instead of failing the import.
+#[tauri::command]
+pub async fn import_tunnels(
+    path: String,
+    mgr: State<'_, AppManager>,
+) -> Result<ImportSummary, String> {
+    let file = transfer::read_import(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    let mut m = mgr.lock().await;
+    let (to_import, skipped) = transfer::split_new(m.configs(), &file.tunnels);
+
+    let mut warnings = Vec::new();
+    for t in &to_import {
+        let c = &t.config;
+        // Only write Some secrets — null means "not exported", never "delete".
+        if let Some(pw) = &t.secret.password {
+            if let Err(e) = store::set_password(&c.jump_user, &c.jump_host, c.jump_port, pw) {
+                warnings.push(format!("「{}」密码写入钥匙串失败: {}", c.name, e));
+            }
+        }
+        if let Some(u) = &t.secret.target_user {
+            if let Err(e) = store::set_target_user(&c.jump_host, c.jump_port, u) {
+                warnings.push(format!("「{}」用户名写入钥匙串失败: {}", c.name, e));
+            }
+        }
+        m.add_config(c.clone());
+    }
+    if !to_import.is_empty() {
+        store::save_tunnels(m.configs()).map_err(|e| e.to_string())?;
+    }
+    Ok(ImportSummary {
+        imported: to_import.len(),
+        skipped: skipped.len(),
+        skipped_names: skipped.iter().map(|t| t.config.name.clone()).collect(),
+        warnings,
+    })
 }
 
 // ─── Password ─────────────────────────────────────────────────────────────────

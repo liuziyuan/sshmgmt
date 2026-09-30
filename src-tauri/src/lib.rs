@@ -4,6 +4,7 @@ mod model;
 mod parser;
 mod probe;
 mod store;
+mod transfer;
 mod tunnel;
 
 use commands::AppManager;
@@ -30,6 +31,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(TokioMutex::new(manager) as AppManager)
         .setup(|app| {
             setup_tray(app)?;
@@ -60,6 +62,8 @@ pub fn run() {
             commands::submit_password,
             commands::list_public_keys,
             commands::delete_saved_password,
+            commands::export_tunnels,
+            commands::import_tunnels,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { save, open } from "@tauri-apps/plugin-dialog";
 import type { TunnelConfig, TunnelInfo, TunnelState } from "./types";
 
 // ─── Queries ─────────────────────────────────────────────────────────────────
@@ -60,6 +61,36 @@ export const listPublicKeys = (): Promise<PublicKeyInfo[]> =>
 
 export const deleteSavedPassword = (id: string): Promise<void> =>
   invoke("delete_saved_password", { id });
+
+// ─── Import / Export ─────────────────────────────────────────────────────────
+
+export interface ImportSummary {
+  imported: number;
+  skipped: number;
+  skipped_names: string[];
+  warnings: string[];
+}
+
+export const exportTunnels = (path: string): Promise<number> =>
+  invoke("export_tunnels", { path });
+
+export const importTunnels = (path: string): Promise<ImportSummary> =>
+  invoke("import_tunnels", { path });
+
+/** Native save dialog for the export file; returns null when cancelled. */
+export const pickExportPath = (): Promise<string | null> =>
+  save({
+    defaultPath: "tunnels.sshmgmt.json",
+    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+  });
+
+/** Native open dialog for an import file; single selection, null when cancelled. */
+export const pickImportPath = (): Promise<string | null> =>
+  open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+  }) as Promise<string | null>;
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 
