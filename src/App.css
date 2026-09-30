@@ -25,6 +25,14 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
+/* Replace WebKit's native focus ring (a thick blue halo that renders unevenly
+   around wide flat inputs) with our own theme-colored border highlight.
+   Keeps focus visibility for keyboard users without the native glow. */
+input:focus, textarea:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
 code {
   font-family: "SF Mono", "Fira Code", "Courier New", monospace;
   font-size: 0.9em;

@@ -3,6 +3,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import {
   listTunnels, connectTunnel, disconnectTunnel, reconnectTunnel,
   reconnectAll, deleteTunnel, onStateChanged, onPasswordRequired, onNotice,
+  exportTunnels, importTunnels, pickExportPath, pickImportPath,
+  getGroupOrder, setGroupOrder as setGroupOrderAPI,
+  getCollapsedGroups, setCollapsedGroups as setCollapsedGroupsAPI,
 } from "./api";
 import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
@@ -30,6 +33,8 @@ export default function App() {
   const [editTarget, setEditTarget] = useState<TunnelInfo | null>(null);
   const [pendingPassword, setPendingPassword] = useState<PasswordRequiredPayload | null>(null);
   const [banners, setBanners] = useState<Banner[]>([]);
+  const [groupOrder, setGroupOrder] = useState<string[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
   const bannerIdRef = useRef(0);
 
   const dismissBanner = useCallback((id: number) => {
@@ -59,6 +64,16 @@ export default function App() {
       setTunnels(await listTunnels());
     } catch (e) {
       notify("error", `加载隧道列表失败：${e}`);
+    }
+    try {
+      setGroupOrder(await getGroupOrder());
+    } catch (e) {
+      notify("error", `加载分组顺序失败：${e}`);
+    }
+    try {
+      setCollapsedGroups(await getCollapsedGroups());
+    } catch (e) {
+      notify("error", `加载分组折叠状态失败：${e}`);
     }
   }, [notify]);
 
@@ -104,6 +119,62 @@ export default function App() {
     catch (e) { notify("error", `删除失败：${e}`); }
   };
 
+  // The export file embeds keychain passwords in PLAINTEXT — remind the user
+  // to treat it like a password in the success banner.
+  const handleExport = async () => {
+    if (tunnels.length === 0) {
+      notify("warn", "当前没有可导出的隧道");
+      return;
+    }
+    try {
+      const path = await pickExportPath();
+      if (!path) return; // user cancelled the dialog
+      const n = await exportTunnels(path);
+      notify("success", `已导出 ${n} 条隧道到 ${path}（文件含明文密码，请妥善保管）`);
+    } catch (e) {
+      notify("error", `导出失败：${e}`);
+    }
+  };
+
+  // Merge import: conflicting tunnels (same id or name) are skipped untouched.
+  // A dialog cancel (null path) exits silently.
+  const handleImport = async () => {
+    try {
+      const path = await pickImportPath();
+      if (!path) return;
+      const s = await importTunnels(path);
+      await reload();
+      if (s.warnings.length > 0) {
+        notify("warn", `导入完成，但部分凭据未写入钥匙串：${s.warnings.join("；")}`);
+      }
+      if (s.skipped > 0) {
+        // warn is persistent (no auto-dismiss) — the skipped-name list needs
+        // to stay readable while the user checks it against the tunnel list.
+        notify("warn", `导入完成：新增 ${s.imported} 条，跳过 ${s.skipped} 条重名隧道（${s.skipped_names.join("、")}）`);
+      } else {
+        notify("success", `导入完成：新增 ${s.imported} 条隧道`);
+      }
+    } catch (e) {
+      notify("error", `导入失败：${e}`);
+    }
+  };
+
+  // Group drag reorder: update locally for instant feedback, persist in the
+  // background; a persistence failure leaves the local order in place and
+  // just surfaces a banner (the next app start reloads the saved order).
+  const handleGroupOrderChange = (order: string[]) => {
+    setGroupOrder(order);
+    setGroupOrderAPI(order).catch((e) => notify("error", `保存分组顺序失败：${e}`));
+  };
+
+  // Collapse state is likewise local-first, persisted in the background.
+  const handleCollapsedChange = (groups: string[]) => {
+    setCollapsedGroups(groups);
+    setCollapsedGroupsAPI(groups).catch((e) =>
+      notify("error", `保存分组折叠状态失败：${e}`)
+    );
+  };
+
   // User clicked ✕ / 取消 on the password prompt: give up on this login
   // attempt entirely (disconnect the tunnel) rather than merely hiding the
   // modal — otherwise the backend keeps waiting on the prompt (up to 5 min)
@@ -132,6 +203,12 @@ export default function App() {
           <span style={{ fontSize: 18, fontWeight: 600 }}>SSH 隧道管理器</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={handleExport} style={btnSecondary}>
+            ⬇ 导出
+          </button>
+          <button onClick={handleImport} style={btnSecondary}>
+            ⬆ 导入
+          </button>
           <button onClick={handleReconnectAll} style={btnSecondary}>
             🔄 全部重连
           </button>
@@ -150,6 +227,10 @@ export default function App() {
       <main style={{ padding: "24px" }}>
         <TunnelList
           tunnels={tunnels}
+          groupOrder={groupOrder}
+          onGroupOrderChange={handleGroupOrderChange}
+          collapsedGroups={collapsedGroups}
+          onCollapsedChange={handleCollapsedChange}
           onConnect={handleConnect}
           onDisconnect={handleDisconnect}
           onReconnect={handleReconnect}

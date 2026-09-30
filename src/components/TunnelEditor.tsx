@@ -25,7 +25,9 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
 
-  // Derived option lists from existing tunnels
+  // Derived option lists from existing tunnels. Group options keep their
+  // stored case; environments are normalized to uppercase so "qa" and "QA"
+  // suggest as the same entry.
   const groupOptions = Array.from(
     new Set(tunnels.map((t) => t.config.group).filter((g): g is string => !!g))
   ).sort();
@@ -33,8 +35,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
   const envOptions = Array.from(
     new Set(
       tunnels
-        .filter((t) => !!group && t.config.group === group)
-        .map((t) => t.config.environment)
+        .map((t) => t.config.environment?.trim().toUpperCase())
         .filter((e): e is string => !!e)
     )
   ).sort();
@@ -65,7 +66,9 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
     setSaving(true);
     setSaveError("");
     const g = group.trim() || null;
-    const env = environment.trim() || null;
+    // Normalize the environment to uppercase so "qa" and "QA" can never
+    // become two separate environments (backend does the same).
+    const env = environment.trim().toUpperCase() || null;
     try {
       if (isEdit) {
         const fresh = await parseCommand(rawCommand);
@@ -157,7 +160,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
           list="env-options"
           value={environment}
           onChange={(e) => setEnvironment(e.target.value)}
-          placeholder={group.trim() ? "选择或输入新环境（如 dev、prod）" : "先填写分组后可选已有环境"}
+          placeholder="选择已有环境，或输入新环境（保存时统一大写）"
           style={inputStyle}
         />
         <datalist id="env-options">
