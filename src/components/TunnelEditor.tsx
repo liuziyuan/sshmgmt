@@ -129,7 +129,11 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
                 value={
                   f.kind === "dynamic"
                     ? `本地 :${f.local_port} → SOCKS 代理（跳板侧解析域名）`
-                    : `本地 :${f.local_port} → ${f.remote_host}:${f.remote_port}`
+                    : f.kind === "remote"
+                      ? `服务器 ${f.remote_bind ? `${f.remote_bind}:` : ""}:${f.local_port} → 本地 ${f.remote_host}:${f.remote_port}`
+                      : f.kind === "local"
+                        ? `本地 :${f.local_port} → ${f.remote_host}:${f.remote_port}`
+                        : "未知转发类型（当前版本不支持）"
                 }
               />
             ))}

@@ -89,10 +89,10 @@ function matchesQuery(t: TunnelInfo, q: string): boolean {
     t.config.environment?.toUpperCase(),
     t.config.jump_host,
     ...t.config.forwards.map((f) => String(f.local_port)),
-    // Dynamic rules carry ""/0 placeholders — searching them would let "0"
-    // match every SOCKS rule, so only Local targets contribute.
+    // Dynamic rules carry ""/0 placeholders and Unknown kinds have unclear
+    // field semantics — only Local and Remote targets contribute.
     ...t.config.forwards
-      .filter((f) => f.kind !== "dynamic")
+      .filter((f) => f.kind === "local" || f.kind === "remote")
       .flatMap((f) => [f.remote_host, String(f.remote_port)]),
   ];
   return fields.some((s) => s && s.toLowerCase().includes(q));
@@ -238,16 +238,37 @@ export default function TunnelList({
       </td>
       <td style={td}>{t.config.name}</td>
       <td style={td}>
-        {t.config.forwards.map((f) => (
-          <div key={f.local_port} style={{ fontSize: 13 }}>
-            <span style={{ color: "#60a5fa" }}>:{f.local_port}</span>
+        {/* Keys are indices: a Remote rule's local_port is a server-side port
+            and may collide with another rule's local port. */}
+        {t.config.forwards.map((f, i) => (
+          <div key={i} style={{ fontSize: 13 }}>
+            {f.kind === "remote" ? (
+              <>
+                <span style={{ color: "#60a5fa" }}>
+                  远端 {f.remote_bind ? `${f.remote_bind}:` : ""}:{f.local_port}
+                </span>
+                {f.local_port === 0 && (
+                  <span style={{ color: "#9ca3af", fontSize: 11 }}>
+                    （服务器动态分配）
+                  </span>
+                )}
+              </>
+            ) : f.kind === "local" || f.kind === "dynamic" ? (
+              <span style={{ color: "#60a5fa" }}>:{f.local_port}</span>
+            ) : (
+              <span title="未知转发类型" style={{ color: "#6b7280" }}>—</span>
+            )}
           </div>
         ))}
       </td>
       <td style={td}>
-        {t.config.forwards.map((f) => (
-          <div key={f.local_port} style={{ fontSize: 12, color: "#d1d5db" }}>
-            {f.kind === "dynamic" ? "SOCKS 代理" : `${f.remote_host}:${f.remote_port}`}
+        {t.config.forwards.map((f, i) => (
+          <div key={i} style={{ fontSize: 12, color: "#d1d5db" }}>
+            {f.kind === "dynamic"
+              ? "SOCKS 代理"
+              : f.kind === "local" || f.kind === "remote"
+                ? `${f.remote_host}:${f.remote_port}`
+                : "未知类型"}
           </div>
         ))}
       </td>
