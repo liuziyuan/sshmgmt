@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-面向在本仓库（sshmgmt）工作的 AI 编码助手的项目说明。
+面向在本仓库（portunnel）工作的 AI 编码助手的项目说明。
 
 ## 项目是什么
 
@@ -26,7 +26,7 @@ src-tauri/src/               后端（Rust）
   tunnel.rs                   核心：连接、两阶段认证、端口转发、断线重连的状态机（见下方"认证与连接状态机"）
   parser.rs                   把一条 `ssh ...` 命令行解析成 TunnelConfig（不支持 -J，只支持单跳 -L）
   model.rs                    Rust 侧数据结构（TunnelConfig/TunnelState/...），需与 src/types.ts 手动保持一致
-  store.rs                    本地持久化（~/.config/sshmgmt/tunnels.json）+ 系统钥匙串读写（密码、记住的目标主机用户名）
+  store.rs                    本地持久化（Linux `~/.config/portunnel/`、macOS `~/Library/Application Support/portunnel/`、Windows `%APPDATA%\portunnel/`；启动时一次性从旧版数据目录复制迁移，旧目录保留）+ 系统钥匙串读写（密码、记住的目标主机用户名）
   probe.rs                    探测本机端口是否已被（本应用或外部）健康的隧道占用
 ```
 
@@ -74,7 +74,7 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 3. `src-tauri/Cargo.toml` 的 `version = "..."`
 4. `src-tauri/tauri.conf.json` 的 `"version": "..."`
 
-改完 `Cargo.toml` 后跑一次 `cargo build`，让 `Cargo.lock` 里 `name = "sshmgmt"` 对应的 `version` 自动同步。
+改完 `Cargo.toml` 后跑一次 `cargo build`，让 `Cargo.lock` 里 `name = "portunnel"` 对应的 `version` 自动同步。
 
 ### 完整发布流程（按顺序，最后一步不能省）
 
@@ -84,7 +84,7 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 4. 本地 `git checkout main && git pull`，确认 `main` 已包含合并后的提交。
 5. **`git tag vX.Y.Z && git push origin vX.Y.Z`** ← 真正触发发布的唯一步骤，tag 版本号要和第 1 步的 4 处版本号一致。
 6. GitHub Actions 在 macOS（arm64 + x64）/ Windows / Linux 上构建，产物自动进一个**草稿** Release（`gh run view <run-id>` 或 Actions 页面看进度）。
-7. 人工去 [Releases 页面](https://github.com/liuziyuan/sshmgmt/releases) 确认草稿内容后点 **Publish**，才算真正对外发布。workflow 不会自动帮你点这一步。
+7. 人工去 [Releases 页面](https://github.com/liuziyuan/portunnel/releases) 确认草稿内容后点 **Publish**，才算真正对外发布。workflow 不会自动帮你点这一步。
 
 ## 其他约定
 

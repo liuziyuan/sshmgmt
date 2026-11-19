@@ -1,4 +1,4 @@
-# sshmgmt — SSH 隧道管理器
+# portunnel — SSH 隧道管理器
 
 一个跨平台桌面应用，用来管理 SSH 本地端口转发（`ssh -L` 隧道）。把那些又长又难记的 `ssh -L 3306:db.internal:3306 user@jump` 命令存成一条条隧道，点一下就连，状态一眼可见，不用再在终端里手敲和盯着窗口。
 
@@ -13,7 +13,7 @@
 - 同时开好几条，分不清哪条通哪条断；
 - 断线后要手动重连。
 
-sshmgmt 把这些隧道集中管理：
+portunnel 把这些隧道集中管理：
 
 - **粘贴即用**：直接粘贴一条 `ssh -L ...` 命令，自动解析成隧道配置。
 - **一键连接 / 断开 / 重连**，每条隧道一个状态灯（🟢 已连接 / 🟠 连接中 / ⚪ 未连接 / 🔴 失败）。断开按钮在「连接中」黄灯阶段同样立即生效，不会卡死。
@@ -33,25 +33,31 @@ sshmgmt 把这些隧道集中管理：
 
 ### 下载安装包
 
-到 [Releases](https://github.com/liuziyuan/sshmgmt/releases) 下载对应平台的包：
+到 [Releases](https://github.com/liuziyuan/portunnel/releases) 下载对应平台的包：
 
 | 平台 | 下载 |
 |------|------|
-| macOS（Apple Silicon，M 系列）| `sshmgmt_x.y.z_aarch64.dmg` |
-| macOS（Intel）| `sshmgmt_x.y.z_x64.dmg` |
-| Windows | `sshmgmt_x.y.z_x64-setup.exe` / `.msi` |
+| macOS（Apple Silicon，M 系列）| `portunnel_x.y.z_aarch64.dmg` |
+| macOS（Intel）| `portunnel_x.y.z_x64.dmg` |
+| Windows | `portunnel_x.y.z_x64-setup.exe` / `.msi` |
 | Linux | `.AppImage` 或 `.deb` |
+
+### 从旧版升级
+
+portunnel 由 sshmgmt 更名而来：升级后自动沿用原有隧道配置、分组与钥匙串密码，无需任何手动操作（首次启动自动迁移数据目录，旧数据保留不删除，可随时回滚旧版）。
+
+如果你安装过旧版，建议安装 portunnel 后卸载旧版本：新旧并存期间两者配置各自独立、会各自分叉（钥匙串密码为二者共用）。
 
 不确定 Mac 芯片？终端执行 `uname -m`：`arm64` 选 aarch64，`x86_64` 选 Intel 包。
 
-### ⚠️ macOS 提示「"sshmgmt" 已损坏，无法打开，你应该将它移到废纸篓」
+### ⚠️ macOS 提示「"portunnel" 已损坏，无法打开，你应该将它移到废纸篓」
 
 **这不是包真的损坏**。因为本应用尚未做 Apple 代码签名 / 公证，macOS Gatekeeper 会给下载的文件打上「隔离」标记并拦截未签名应用，从而误报「已损坏」。
 
 解决（把 app 拖进「应用程序」后，终端执行一次即可）：
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/sshmgmt.app
+xattr -dr com.apple.quarantine /Applications/portunnel.app
 ```
 
 然后正常双击打开。之后不会再提示。
