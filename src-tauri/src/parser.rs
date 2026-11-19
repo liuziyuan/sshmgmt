@@ -168,6 +168,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
                 remote_host,
                 remote_port,
                 kind: ForwardKind::Local,
+                remote_bind: None,
             })
         }
         4 => {
@@ -184,6 +185,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
                 remote_host,
                 remote_port,
                 kind: ForwardKind::Local,
+                remote_bind: None,
             })
         }
         _ => bail!("Invalid -L spec (expected [bind:]lport:rhost:rport): {}", spec),

@@ -230,7 +230,7 @@ async fn connect_and_forward(
     for forward in &config.forwards {
         let bind_addr = if config.bind_all { "0.0.0.0" } else { "127.0.0.1" };
 
-        match forward.kind {
+        match &forward.kind {
             ForwardKind::Local => {
                 let bind = format!("{}:{}", bind_addr, forward.local_port);
 
@@ -304,6 +304,16 @@ async fn connect_and_forward(
                 let notify = session_error.clone();
                 let h = tokio::spawn(socks::serve_dynamic(listener, session, notify));
                 listener_handles.push(h);
+            }
+            // Remote rules create no local listener; the server-side listener
+            // is requested before "Connected" and dispatched by the -R task.
+            ForwardKind::Remote => {}
+            ForwardKind::Unknown(raw) => {
+                tracing::warn!(
+                    "Skipping unsupported forward rule kind {:?} on tunnel {}",
+                    raw,
+                    config.id
+                );
             }
         }
     }

@@ -155,6 +155,7 @@ mod tests {
                 remote_host: "db".into(),
                 remote_port: 5432,
                 kind: ForwardKind::Local,
+                remote_bind: None,
             }],
             bind_all: false,
             identity_file: None,
