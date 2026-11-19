@@ -250,6 +250,15 @@ pub fn classify_channel_error(err: &russh::Error) -> ChannelErrorKind {
     }
 }
 
+/// Wake the tunnel task only when a failed channel open means the session
+/// itself is dead. Extracted so the gating rule has an automated test: a
+/// target-level refusal must never trigger a tunnel-wide reconnect (R1).
+fn notify_if_session_dead(err: &russh::Error, notify: impl FnOnce()) {
+    if classify_channel_error(err) == ChannelErrorKind::Session {
+        notify();
+    }
+}
+
 // ─── Serving dynamic forwards ────────────────────────────────────────────────
 
 /// Time budget for a client to finish the greeting + request handshake.
@@ -379,9 +388,7 @@ where
             // A refused/unreachable target is not a dead session: fail only
             // this request. Only recognized session-level errors wake the
             // tunnel task (the -L path keeps its existing notify unchanged).
-            if classify_channel_error(&e) == ChannelErrorKind::Session {
-                session_error.notify_one();
-            }
+            notify_if_session_dead(&e, || session_error.notify_one());
         }
     }
 
@@ -620,5 +627,37 @@ mod tests {
             classify_channel_error(&russh::Error::Version),
             ChannelErrorKind::Target
         );
+    }
+
+    /// Locks the call-site gating, not just the classifier: a target-level
+    /// failure must invoke the notify closure zero times.
+    #[test]
+    fn target_level_failure_does_not_notify() {
+        use russh::ChannelOpenFailure;
+        let mut calls = 0;
+        for cause in [
+            ChannelOpenFailure::AdministrativelyProhibited,
+            ChannelOpenFailure::ConnectFailed,
+            ChannelOpenFailure::ResourceShortage,
+            ChannelOpenFailure::UnknownChannelType,
+            ChannelOpenFailure::Unknown,
+        ] {
+            notify_if_session_dead(&russh::Error::ChannelOpenFailure(cause), || calls += 1);
+        }
+        assert_eq!(calls, 0);
+    }
+
+    /// Session-level errors notify exactly once each.
+    #[test]
+    fn session_level_failure_notifies_once() {
+        for err in [
+            russh::Error::Disconnect,
+            russh::Error::SendError,
+            russh::Error::HUP,
+        ] {
+            let mut calls = 0;
+            notify_if_session_dead(&err, || calls += 1);
+            assert_eq!(calls, 1, "err: {}", err);
+        }
     }
 }
