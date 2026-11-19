@@ -49,9 +49,6 @@ pub struct ForwardSpec {
 impl ForwardSpec {
     /// The port this rule listens on locally. Local and Dynamic both listen
     /// here; the placeholder remote fields are meaningless for Dynamic.
-    // Wiring lands step-by-step (probe.rs in step 5); tests pin the behavior
-    // meanwhile, so silence dead_code until then.
-    #[allow(dead_code)]
     pub fn listen_port(&self) -> u16 {
         self.local_port
     }

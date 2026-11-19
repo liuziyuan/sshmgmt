@@ -53,7 +53,7 @@ pub async fn probe_forwards(forwards: &[ForwardSpec]) -> PortStatus {
 
     let mut all_working = true;
     for f in forwards {
-        match probe_port(f.local_port).await {
+        match probe_port(f.listen_port()).await {
             PortStatus::Free => return PortStatus::Free,
             PortStatus::Working => {}
             PortStatus::Broken => all_working = false,
