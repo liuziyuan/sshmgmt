@@ -108,8 +108,6 @@ impl ForwardSpec {
 
     /// Whether this rule creates a listener on the local machine. Remote and
     /// Unknown rules have no local port to probe or kill.
-    // Wired into probe/kill in r5; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn has_local_listener(&self) -> bool {
         matches!(&self.kind, ForwardKind::Local | ForwardKind::Dynamic)
     }

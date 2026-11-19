@@ -128,9 +128,12 @@ pub async fn connect_tunnel(
             m.mark_external(&id, &app);
         }
         // External tunnel is squatting the port but broken → free it, then start.
+        // Only local listener ports are killed: a Remote rule's port is on the
+        // server side and may legitimately coincide with an unrelated local
+        // process (B5).
         PortStatus::Broken => {
-            for f in &forwards {
-                probe::kill_port_listeners(f.local_port);
+            for port in probe::local_listen_ports(&forwards) {
+                probe::kill_port_listeners(port);
             }
             m.start_tunnel(&id, &app);
         }
