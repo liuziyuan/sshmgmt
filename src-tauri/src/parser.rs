@@ -83,6 +83,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
                 match c {
                     'L' => forwards.push(parse_forward_spec(&arg)?),
                     'D' => forwards.push(parse_dynamic_spec(&arg)?),
+                    'R' => forwards.push(parse_remote_spec(&arg)?),
                     'i' => identity_file = Some(arg),
                     'p' => {
                         jump_port = arg
@@ -120,7 +121,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
     }
 
     if forwards.is_empty() {
-        bail!("No -L/-D port forwarding found in command");
+        bail!("No -L/-D/-R port forwarding found in command");
     }
 
     let display_name = name.unwrap_or_else(|| {
@@ -211,6 +212,33 @@ fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec> {
         .parse()
         .map_err(|_| anyhow!("Invalid port in -D: {}", spec))?;
     Ok(ForwardSpec::dynamic(port))
+}
+
+/// Parse a `-R` remote-forward spec: `[bind:]listen_port:target_host:target_port`.
+///
+/// - 3 parts: `listen_port:target_host:target_port`
+/// - 4 parts: `bind:listen_port:target_host:target_port`
+///
+/// A listen port of 0 is valid (the server picks one at connect time). The
+/// bind segment is kept as-is (`None` when absent, `Some("")` for a leading
+/// colon) — the caller maps `None` to the safe "localhost" default.
+fn parse_remote_spec(spec: &str) -> Result<ForwardSpec> {
+    let parts: Vec<&str> = spec.splitn(4, ':').collect();
+    let (bind, listen_port_str, host, target_port_str) = match parts.len() {
+        3 => (None, parts[0], parts[1], parts[2]),
+        4 => (Some(parts[0].to_string()), parts[1], parts[2], parts[3]),
+        _ => bail!("Invalid -R spec (expected [bind:]port:host:port): {}", spec),
+    };
+    let listen_port = listen_port_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid remote listen port in -R: {}", listen_port_str))?;
+    if host.is_empty() {
+        bail!("Invalid -R spec: empty target host: {}", spec);
+    }
+    let target_port = target_port_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid target port in -R: {}", target_port_str))?;
+    Ok(ForwardSpec::remote(listen_port, host, target_port, bind))
 }
 
 /// Parse "host" or "host:port". Returns (host, Some(port)) if port is present.
@@ -354,5 +382,89 @@ mod tests {
         assert_eq!(d.local_port, 1080);
         assert_eq!(d.remote_host, "");
         assert_eq!(d.remote_port, 0);
+    }
+
+    // ─── -R (remote forwards, B4) ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_remote_bare() {
+        let cmd = "ssh -R 8080:localhost:80 user@jump.example.com";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.forwards.len(), 1);
+        let f = &cfg.forwards[0];
+        assert_eq!(f.kind, ForwardKind::Remote);
+        assert_eq!(f.local_port, 8080);
+        assert_eq!(f.listen_port(), 8080);
+        assert_eq!(f.target(), Some(("localhost", 80)));
+        assert_eq!(f.remote_bind, None);
+        assert!(!f.has_local_listener());
+    }
+
+    #[test]
+    fn test_parse_remote_with_bind() {
+        let cmd = "ssh -R 0.0.0.0:8080:10.0.0.5:80 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        let f = &cfg.forwards[0];
+        assert_eq!(f.kind, ForwardKind::Remote);
+        assert_eq!(f.remote_bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(f.local_port, 8080);
+        assert_eq!(f.target(), Some(("10.0.0.5", 80)));
+    }
+
+    #[test]
+    fn test_parse_remote_empty_bind_prefix() {
+        // A leading colon keeps the empty bind segment verbatim (OpenSSH
+        // semantics: bind every interface).
+        let cmd = "ssh -R :8080:host:80 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        let f = &cfg.forwards[0];
+        assert_eq!(f.remote_bind.as_deref(), Some(""));
+        assert_eq!(f.local_port, 8080);
+        assert_eq!(f.target(), Some(("host", 80)));
+    }
+
+    #[test]
+    fn test_parse_remote_zero_port() {
+        let cmd = "ssh -R 0:host:80 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        let f = &cfg.forwards[0];
+        assert_eq!(f.kind, ForwardKind::Remote);
+        assert_eq!(f.local_port, 0);
+    }
+
+    #[test]
+    fn test_parse_remote_concatenated() {
+        let cmd = "ssh -R8080:host:80 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.forwards.len(), 1);
+        assert_eq!(cfg.forwards[0].kind, ForwardKind::Remote);
+        assert_eq!(cfg.forwards[0].local_port, 8080);
+        assert_eq!(cfg.forwards[0].target(), Some(("host", 80)));
+    }
+
+    #[test]
+    fn test_parse_remote_empty_host_rejected() {
+        assert!(parse_ssh_command("ssh -R 8080::80 user@jump", None).is_err());
+        assert!(parse_ssh_command("ssh -R notaport:host:80 user@jump", None).is_err());
+        assert!(parse_ssh_command("ssh -R 8080:host:notaport user@jump", None).is_err());
+    }
+
+    #[test]
+    fn test_parse_mixed_all_kinds() {
+        let cmd = "ssh -L 10008:host:3306 -D 1080 -R 8080:localhost:80 u@j";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        // Push order follows command order.
+        assert_eq!(cfg.forwards.len(), 3);
+        assert_eq!(cfg.forwards[0].kind, ForwardKind::Local);
+        assert_eq!(cfg.forwards[1].kind, ForwardKind::Dynamic);
+        assert_eq!(cfg.forwards[2].kind, ForwardKind::Remote);
+        assert_eq!(cfg.forwards[2].local_port, 8080);
+        assert_eq!(cfg.forwards[2].target(), Some(("localhost", 80)));
     }
 }

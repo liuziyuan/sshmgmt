@@ -138,8 +138,6 @@ impl ForwardSpec {
     /// (0 = let the server pick) and tunnels connections back to the local
     /// `target_host:target_port`. `bind` is the server-side bind address;
     /// None means "localhost".
-    // Wired into the parser in r3; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn remote(
         listen_port: u16,
         target_host: impl Into<String>,
