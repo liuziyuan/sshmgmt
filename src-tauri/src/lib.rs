@@ -30,6 +30,11 @@ pub fn run() {
 
     let mut tunnels = load_tunnels();
     migrate_env_case(&mut tunnels);
+    if migrate_hops(&mut tunnels) {
+        if let Err(e) = store::save_tunnels(&tunnels) {
+            tracing::warn!("hops migration failed: {}", e);
+        }
+    }
     let manager = TunnelManager::new(tunnels);
 
     tauri::Builder::default()
@@ -101,6 +106,19 @@ fn migrate_env_case(tunnels: &mut Vec<TunnelConfig>) {
             tracing::warn!("env case migration failed: {}", e);
         }
     }
+}
+
+// One-time migration: give configs written before the `hops` field existed an
+// explicit hop chain (and repair a drifted legacy mirror). Idempotent via
+// `ensure_hops`, so the file is rewritten only when something changed.
+fn migrate_hops(tunnels: &mut [TunnelConfig]) -> bool {
+    let mut changed = false;
+    for c in tunnels.iter_mut() {
+        if c.ensure_hops() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ─── 系统托盘 ──────────────────────────────────────────────────────────────────
@@ -185,4 +203,54 @@ fn intercept_minimize(app: &tauri::App) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{ForwardKind, ForwardSpec, Hop};
+
+    /// A config as written by v1.4 and earlier: no `hops`, legacy fields only.
+    fn legacy_config(id: &str) -> TunnelConfig {
+        TunnelConfig {
+            id: id.to_string(),
+            name: "t".into(),
+            raw_command: "ssh -L 1:h:2 jump".into(),
+            jump_user: "u".into(),
+            jump_host: "jump".into(),
+            jump_port: 2222,
+            hops: Vec::new(),
+            forwards: vec![ForwardSpec {
+                local_port: 1,
+                remote_host: "h".into(),
+                remote_port: 2,
+                kind: ForwardKind::Local,
+                remote_bind: None,
+            }],
+            bind_all: false,
+            identity_file: None,
+            auto_reconnect: true,
+            group: None,
+            environment: None,
+        }
+    }
+
+    #[test]
+    fn migrate_hops_builds_single_hop_from_legacy() {
+        let mut tunnels = vec![legacy_config("a")];
+
+        assert!(migrate_hops(&mut tunnels));
+        assert_eq!(
+            tunnels[0].hops,
+            vec![Hop { user: "u".into(), host: "jump".into(), port: 2222 }]
+        );
+    }
+
+    #[test]
+    fn migrate_hops_idempotent_second_run_false() {
+        let mut tunnels = vec![legacy_config("a")];
+
+        assert!(migrate_hops(&mut tunnels));
+        assert!(!migrate_hops(&mut tunnels));
+    }
 }

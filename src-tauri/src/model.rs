@@ -47,8 +47,6 @@ impl TunnelConfig {
     ///   (repairs drift from older versions or hand-edited files).
     ///
     /// Idempotent: a second call on an already-consistent config returns false.
-    // Wired into startup migration in t3; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn ensure_hops(&mut self) -> bool {
         if self.hops.is_empty() {
             if self.jump_host.is_empty() {
