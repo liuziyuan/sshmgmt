@@ -15,6 +15,12 @@ export interface ForwardSpec {
   remote_bind?: string;
 }
 
+export interface Hop {
+  user: string;
+  host: string;
+  port: number;
+}
+
 export interface TunnelConfig {
   id: string;
   name: string;
@@ -22,12 +28,26 @@ export interface TunnelConfig {
   jump_user: string;
   jump_host: string;
   jump_port: number;
+  /** Authoritative jump chain; absent on configs written by older versions. */
+  hops?: Hop[];
   forwards: ForwardSpec[];
   bind_all: boolean;
   identity_file: string | null;
   auto_reconnect: boolean;
   group?: string | null;
   environment?: string | null;
+}
+
+/**
+ * Jump chain for display: the authoritative `hops`, else a single hop
+ * synthesized from the legacy mirror fields (v1.4 and earlier configs).
+ */
+export function resolveHops(config: TunnelConfig): Hop[] {
+  if (config.hops && config.hops.length > 0) return config.hops;
+  if (config.jump_host) {
+    return [{ user: config.jump_user, host: config.jump_host, port: config.jump_port }];
+  }
+  return [];
 }
 
 export type TunnelState =

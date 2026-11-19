@@ -120,6 +120,10 @@ export interface PasswordRequiredPayload {
   layer: "jump" | "target";
   host: string;
   needUsername: boolean;
+  /** 1-based hop number; present only for multi-hop "jump" prompts. */
+  hopIndex?: number;
+  /** Total hops in the chain; present only for multi-hop "jump" prompts. */
+  hopTotal?: number;
 }
 
 export const onPasswordRequired = (

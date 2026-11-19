@@ -16,7 +16,7 @@ interface Props {
 }
 
 export default function PasswordModal({ request, notify, onClose, onCancel }: Props) {
-  const { id, prompt, layer, host, needUsername } = request;
+  const { id, prompt, layer, host, needUsername, hopIndex, hopTotal } = request;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [save, setSave] = useState(true);
@@ -71,7 +71,12 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
     boxSizing: "border-box",
   };
 
-  const title = layer === "target" ? "🔐 目标主机登陆" : "🔐 需要密码";
+  const multiHop = layer === "jump" && hopTotal !== undefined && hopTotal > 1;
+  const title = layer === "target"
+    ? "🔐 目标主机登陆"
+    : multiHop
+      ? `🔐 第 ${hopIndex}/${hopTotal} 跳 · ${host}`
+      : "🔐 需要密码";
   const hostLabel = layer === "target" ? "内网目标主机" : "跳板机";
 
   return (

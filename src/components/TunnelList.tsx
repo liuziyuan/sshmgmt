@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { TunnelInfo, TunnelState } from "../types";
+import { resolveHops, type TunnelInfo, type TunnelState } from "../types";
 
 interface Props {
   tunnels: TunnelInfo[];
@@ -88,6 +88,9 @@ function matchesQuery(t: TunnelInfo, q: string): boolean {
     // Search environments case-insensitively in both directions.
     t.config.environment?.toUpperCase(),
     t.config.jump_host,
+    // Every hop in the chain is searchable (single-hop configs synthesize
+    // their hop from the legacy fields above, which stays as a fallback).
+    ...resolveHops(t.config).flatMap((h) => [h.host, h.user]),
     ...t.config.forwards.map((f) => String(f.local_port)),
     // Dynamic rules carry ""/0 placeholders and Unknown kinds have unclear
     // field semantics — only Local and Remote targets contribute.
@@ -224,7 +227,9 @@ export default function TunnelList({
     onGroupOrderChange(keys.filter((k) => k !== UNGROUPED_KEY));
   };
 
-  const renderRow = (t: TunnelInfo) => (
+  const renderRow = (t: TunnelInfo) => {
+    const hops = resolveHops(t.config);
+    return (
     <tr key={t.config.id} style={{ borderBottom: "1px solid #1f2937" }}>
       <td style={td}>
         {t.config.group
@@ -274,8 +279,15 @@ export default function TunnelList({
       </td>
       <td style={td}>
         <span style={{ fontSize: 12 }}>
-          {t.config.jump_user}@{t.config.jump_host}
-          {t.config.jump_port !== 22 ? `:${t.config.jump_port}` : ""}
+          {hops.length > 0
+            ? hops.map((h, i) => (
+                <span key={i}>
+                  {i > 0 ? " → " : ""}
+                  {h.user}@{h.host}
+                  {h.port !== 22 ? `:${h.port}` : ""}
+                </span>
+              ))
+            : "—"}
         </span>
       </td>
       <td style={td}>
@@ -299,7 +311,8 @@ export default function TunnelList({
         )}
       </td>
     </tr>
-  );
+    );
+  };
 
   const tableHeader = (
     <thead>

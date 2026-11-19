@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { addTunnel, updateTunnel, parseCommand } from "../api";
-import type { TunnelConfig, TunnelInfo } from "../types";
+import { resolveHops, type TunnelConfig, type TunnelInfo } from "../types";
 import type { Notify } from "../App";
 
 interface Props {
@@ -39,6 +39,9 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         .filter((e): e is string => !!e)
     )
   ).sort();
+
+  // Multi-hop preview: one row per hop; single hop keeps the v1.4 line.
+  const previewHops = preview ? resolveHops(preview) : [];
 
   // Debounced parse preview
   useEffect(() => {
@@ -121,7 +124,17 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
             borderRadius: 6, padding: 12, marginTop: 8, fontSize: 12,
           }}>
             <div style={{ color: "#9ca3af", marginBottom: 6 }}>解析结果预览</div>
-            <Row label="跳板机" value={`${preview.jump_user}@${preview.jump_host}:${preview.jump_port}`} />
+            {previewHops.length > 1 ? (
+              previewHops.map((h, i) => (
+                <Row
+                  key={i}
+                  label={`第 ${i + 1} 跳`}
+                  value={`${h.user}@${h.host}:${h.port}`}
+                />
+              ))
+            ) : (
+              <Row label="跳板机" value={`${preview.jump_user}@${preview.jump_host}:${preview.jump_port}`} />
+            )}
             {preview.forwards.map((f, i) => (
               <Row
                 key={i}
