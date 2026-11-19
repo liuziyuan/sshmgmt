@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use uuid::Uuid;
 
-use crate::model::{ForwardKind, ForwardSpec, TunnelConfig};
+use crate::model::{ForwardKind, ForwardSpec, Hop, TunnelConfig};
 
 /// Parse an ssh command string into a TunnelConfig.
 ///
@@ -132,6 +132,13 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
         }
     });
 
+    // Single-hop config for now; t2 replaces this with the full -J chain.
+    let hops = vec![Hop {
+        user: jump_user.clone(),
+        host: jump_host.clone(),
+        port: jump_port,
+    }];
+
     Ok(TunnelConfig {
         id: Uuid::new_v4().to_string(),
         name: display_name,
@@ -139,6 +146,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
         jump_user,
         jump_host,
         jump_port,
+        hops,
         forwards,
         bind_all,
         identity_file,

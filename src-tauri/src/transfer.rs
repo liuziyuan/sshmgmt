@@ -140,7 +140,7 @@ pub fn split_new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ForwardKind, ForwardSpec};
+    use crate::model::{ForwardKind, ForwardSpec, Hop};
 
     fn config(id: &str, name: &str) -> TunnelConfig {
         TunnelConfig {
@@ -150,6 +150,7 @@ mod tests {
             jump_user: "user".into(),
             jump_host: "jump".into(),
             jump_port: 22,
+            hops: vec![Hop { user: "user".into(), host: "jump".into(), port: 22 }],
             forwards: vec![ForwardSpec {
                 local_port: 5432,
                 remote_host: "db".into(),

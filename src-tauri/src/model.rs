@@ -1,5 +1,14 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// One SSH hop: the machine we connect through (or, for the last hop, the
+/// machine we log into and forward from).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hop {
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelConfig {
     pub id: String,
@@ -7,10 +16,15 @@ pub struct TunnelConfig {
     pub name: String,
     /// Original ssh command string (for display / re-parse)
     pub raw_command: String,
-    /// SSH username (may contain '@', e.g. "liu.zy@pg.com")
+    /// SSH username (may contain '@', e.g. "liu.zy@pg.com").
+    /// Legacy mirror of `hops[0].user`, kept for older app versions.
     pub jump_user: String,
     pub jump_host: String,
     pub jump_port: u16,
+    /// Authoritative jump chain. Empty in configs written by older versions;
+    /// `ensure_hops` fills it from the legacy mirror at load time.
+    #[serde(default)]
+    pub hops: Vec<Hop>,
     pub forwards: Vec<ForwardSpec>,
     /// -g flag: bind listener on 0.0.0.0 instead of 127.0.0.1
     pub bind_all: bool,
@@ -23,6 +37,75 @@ pub struct TunnelConfig {
     /// Optional environment label (e.g. dev, staging, prod)
     #[serde(default)]
     pub environment: Option<String>,
+}
+
+impl TunnelConfig {
+    /// Reconcile `hops` with the legacy mirror. Returns whether anything
+    /// changed (so callers can decide to persist):
+    /// - empty hops + a legacy jump host → synthesize a single hop;
+    /// - non-empty hops → rewrite the legacy fields to mirror the first hop
+    ///   (repairs drift from older versions or hand-edited files).
+    ///
+    /// Idempotent: a second call on an already-consistent config returns false.
+    // Wired into startup migration in t3; tests pin the semantics before that.
+    #[allow(dead_code)]
+    pub fn ensure_hops(&mut self) -> bool {
+        if self.hops.is_empty() {
+            if self.jump_host.is_empty() {
+                return false;
+            }
+            self.hops.push(Hop {
+                user: self.jump_user.clone(),
+                host: self.jump_host.clone(),
+                port: self.jump_port,
+            });
+            return true;
+        }
+
+        let first = &self.hops[0];
+        if first.user == self.jump_user
+            && first.host == self.jump_host
+            && first.port == self.jump_port
+        {
+            return false;
+        }
+        self.jump_user = first.user.clone();
+        self.jump_host = first.host.clone();
+        self.jump_port = first.port;
+        true
+    }
+
+    /// First hop, falling back to the legacy mirror when `hops` is absent.
+    /// None only when neither source names a host.
+    // Wired into export/import in t6; tests pin the semantics before that.
+    #[allow(dead_code)]
+    pub fn first_hop(&self) -> Option<Hop> {
+        if let Some(first) = self.hops.first() {
+            return Some(first.clone());
+        }
+        if self.jump_host.is_empty() {
+            None
+        } else {
+            Some(Hop {
+                user: self.jump_user.clone(),
+                host: self.jump_host.clone(),
+                port: self.jump_port,
+            })
+        }
+    }
+
+    /// The full jump chain (hops + final destination). Falls back to a
+    /// synthesized single hop for configs without `hops`. Empty when there is
+    /// nothing to connect to (callers treat that as a fatal config error).
+    // Wired into connection setup in t4; tests pin the semantics before that.
+    #[allow(dead_code)]
+    pub fn resolved_hops(&self) -> Vec<Hop> {
+        if !self.hops.is_empty() {
+            self.hops.clone()
+        } else {
+            self.first_hop().into_iter().collect()
+        }
+    }
 }
 
 /// Kind of a forwarding rule. `Local` = classic `ssh -L` (fixed target through
@@ -302,5 +385,102 @@ mod tests {
         assert!(!json.contains("remote_bind"), "json was: {}", json);
         let back: ForwardSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.remote_bind, None);
+    }
+
+    // ─── hops / legacy mirror (C5) ───────────────────────────────────────────
+
+    fn tunnel_config() -> TunnelConfig {
+        TunnelConfig {
+            id: "id".into(),
+            name: "t".into(),
+            raw_command: "ssh -L 1:h:2 jump".into(),
+            jump_user: "legacy-user".into(),
+            jump_host: "legacy-host".into(),
+            jump_port: 2222,
+            hops: Vec::new(),
+            forwards: vec![spec(ForwardKind::Local)],
+            bind_all: false,
+            identity_file: None,
+            auto_reconnect: true,
+            group: None,
+            environment: None,
+        }
+    }
+
+    #[test]
+    fn legacy_config_without_hops_gets_single_hop() {
+        let json = r#"{"id":"a","name":"n","raw_command":"ssh","jump_user":"u",
+            "jump_host":"h","jump_port":2200,"forwards":[],"bind_all":false,
+            "identity_file":null,"auto_reconnect":true}"#;
+        let mut cfg: TunnelConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.hops.is_empty());
+
+        // Runtime resolution already works before migration runs.
+        assert_eq!(
+            cfg.resolved_hops(),
+            vec![Hop { user: "u".into(), host: "h".into(), port: 2200 }]
+        );
+
+        assert!(cfg.ensure_hops());
+        assert_eq!(cfg.hops.len(), 1);
+        assert_eq!(cfg.hops[0].host, "h");
+    }
+
+    #[test]
+    fn ensure_hops_syncs_legacy_mirror_from_first_hop() {
+        let mut cfg = tunnel_config();
+        cfg.hops = vec![
+            Hop { user: "new-u".into(), host: "new-h".into(), port: 22 },
+            Hop { user: "final".into(), host: "final-h".into(), port: 22 },
+        ];
+        assert!(cfg.ensure_hops());
+        assert_eq!(cfg.jump_user, "new-u");
+        assert_eq!(cfg.jump_host, "new-h");
+        assert_eq!(cfg.jump_port, 22);
+    }
+
+    #[test]
+    fn ensure_hops_is_idempotent() {
+        let mut cfg = tunnel_config();
+        assert!(cfg.ensure_hops());
+        assert!(!cfg.ensure_hops());
+    }
+
+    #[test]
+    fn serialization_double_writes_hops_and_first_hop() {
+        let mut cfg = tunnel_config();
+        cfg.hops = vec![
+            Hop { user: "u1".into(), host: "h1".into(), port: 2222 },
+            Hop { user: "u2".into(), host: "h2".into(), port: 22 },
+        ];
+        cfg.ensure_hops();
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains(r#""hops":[{"user":"u1","host":"h1","port":2222}"#),
+            "json was: {}",
+            json
+        );
+        assert!(json.contains(r#""jump_host":"h1""#), "json was: {}", json);
+    }
+
+    #[test]
+    fn first_hop_falls_back_to_legacy_fields() {
+        let cfg = tunnel_config();
+        assert_eq!(
+            cfg.first_hop(),
+            Some(Hop { user: "legacy-user".into(), host: "legacy-host".into(), port: 2222 })
+        );
+    }
+
+    #[test]
+    fn resolved_hops_empty_when_nothing_to_synthesize() {
+        let mut cfg = tunnel_config();
+        cfg.jump_user = String::new();
+        cfg.jump_host = String::new();
+        cfg.jump_port = 22;
+        assert_eq!(cfg.first_hop(), None);
+        assert!(cfg.resolved_hops().is_empty());
+        assert!(!cfg.ensure_hops());
     }
 }
