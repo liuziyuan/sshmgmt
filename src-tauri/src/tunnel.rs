@@ -23,8 +23,22 @@ pub enum TunnelControl {
 
 // ─── SSH client handler ───────────────────────────────────────────────────────
 
+/// A server-initiated `forwarded-tcpip` connection, produced when a `-R`
+/// listener on the server receives a connection. Handed from the SSH read loop
+/// to the tunnel task through an unbounded channel.
+// Temporary allow: r6 only builds the inert plumbing; r7 reads these fields.
+#[allow(dead_code)]
+pub(crate) struct ForwardedConn {
+    pub listen_addr: String,
+    pub listen_port: u16,
+    pub channel: russh::Channel<russh::client::Msg>,
+}
+
 pub(crate) struct SshClientHandler {
     disconnect_tx: Option<oneshot::Sender<()>>,
+    /// Present only on the primary jump-host connection when the tunnel has
+    /// Remote rules; receives forwarded-tcpip channels from the read loop.
+    forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
 }
 
 /// When the russh connection task exits (keepalive failure, EOF, etc.),
@@ -47,6 +61,33 @@ impl russh::client::Handler for SshClientHandler {
     ) -> Result<bool, Self::Error> {
         // TOFU: trust on first use. TODO: verify against known_hosts.
         Ok(true)
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        // Runs inside the connection's read loop: hand the channel off and
+        // return immediately. Returning Err here would interrupt the whole
+        // connection (russh propagates it through `?`), so every failure is
+        // swallowed. russh has already confirmed the channel; dropping it
+        // closed the server-side connection.
+        let Ok(listen_port) = u16::try_from(connected_port) else {
+            return Ok(());
+        };
+        if let Some(tx) = &self.forward_tx {
+            let _ = tx.send(ForwardedConn {
+                listen_addr: connected_address.to_string(),
+                listen_port,
+                channel,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -90,6 +131,14 @@ enum ConnectError {
 struct AuthOutcome {
     authed: bool,
     pubkey_uploaded: Option<bool>,
+}
+
+/// An authenticated jump-host session plus what the forwarding layer needs.
+/// `forward_rx` is Some only when the tunnel has Remote rules.
+struct EstablishedSession {
+    handle: russh::client::Handle<SshClientHandler>,
+    disconnect_rx: oneshot::Receiver<()>,
+    forward_rx: Option<mpsc::UnboundedReceiver<ForwardedConn>>,
 }
 
 // ─── Main tunnel loop ─────────────────────────────────────────────────────────
@@ -198,7 +247,11 @@ async fn connect_and_forward(
     // time out — the Disconnect button would appear to do nothing. Racing
     // establishment against `control_rx` makes Stop/Reconnect take effect
     // immediately at any point up through "Connected".
-    let (session, disconnect_rx) = tokio::select! {
+    let EstablishedSession {
+        handle: session,
+        disconnect_rx,
+        forward_rx,
+    } = tokio::select! {
         res = establish_session(config, password_senders, app) => res?,
         ctrl = control_rx.recv() => {
             // Abort: `establish_session`'s future (and everything it was
@@ -215,6 +268,10 @@ async fn connect_and_forward(
             };
         }
     };
+
+    // Inert until r7 wires tcpip_forward + dispatch; keeping the receiver
+    // alive prevents the sender side from erroring on early channel pushes.
+    let _ = &forward_rx;
 
     // Both hops verified — now green.
     update_state(state_map, &config.id, TunnelState::Connected);
@@ -354,12 +411,26 @@ async fn establish_session(
     config: &TunnelConfig,
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
-) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
+) -> Result<EstablishedSession, ConnectError> {
     let ssh_config = Arc::new(russh::client::Config {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
         ..Default::default()
     });
+
+    // Only tunnels with Remote rules need the forwarded-tcpip channel. Both
+    // auth-phase connections carry the same sender; whichever connection ends
+    // up authenticated is the one whose handler can receive pushed channels.
+    let (forward_tx, forward_rx) = if config
+        .forwards
+        .iter()
+        .any(|f| f.kind == ForwardKind::Remote)
+    {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     // Phase 1: connect and try local key files only, on their own connection.
     // Some servers (esp. AD/Kerberos-integrated jump hosts) set a very low
@@ -367,7 +438,8 @@ async fn establish_session(
     // try_publickey_auth) alone can burn through that budget, and if we then
     // continued on the SAME connection the password attempt below would never
     // even get a chance — the server would have already disconnected us.
-    let (mut session, mut disconnect_rx) = connect_jump_host(ssh_config.clone(), config).await?;
+    let (mut session, mut disconnect_rx) =
+        connect_jump_host(ssh_config.clone(), config, forward_tx.clone()).await?;
 
     let mut pubkey_authed = false;
     for key_path in key_paths(config.identity_file.as_deref()) {
@@ -397,7 +469,7 @@ async fn establish_session(
         // refused every key or was disconnected outright by the server, this
         // guarantees the password attempt gets a clean MaxAuthTries budget —
         // exactly like running a second, separate `ssh` invocation would.
-        let (session2, disconnect_rx2) = connect_jump_host(ssh_config, config).await?;
+        let (session2, disconnect_rx2) = connect_jump_host(ssh_config, config, forward_tx).await?;
         session = session2;
         disconnect_rx = disconnect_rx2;
 
@@ -460,7 +532,11 @@ async fn establish_session(
         }
     }
 
-    Ok((session, disconnect_rx))
+    Ok(EstablishedSession {
+        handle: session,
+        disconnect_rx,
+        forward_rx,
+    })
 }
 
 /// Max time to wait for the initial TCP+SSH handshake to the jump host.
@@ -478,10 +554,12 @@ const JUMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 async fn connect_jump_host(
     ssh_config: Arc<russh::client::Config>,
     config: &TunnelConfig,
+    forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
 ) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
     let handler = SshClientHandler {
         disconnect_tx: Some(disconnect_tx),
+        forward_tx,
     };
     let connect_fut = russh::client::connect(
         ssh_config,
@@ -748,7 +826,10 @@ async fn setup_second_layer(
         let stream = channel.into_stream();
         let ssh_config = Arc::new(russh::client::Config::default());
         let (tx, _rx) = oneshot::channel::<()>();
-        let handler = SshClientHandler { disconnect_tx: Some(tx) };
+        let handler = SshClientHandler {
+            disconnect_tx: Some(tx),
+            forward_tx: None,
+        };
         russh::client::connect_stream(ssh_config, stream, handler)
             .await
             .map_err(|e| ConnectError::Retriable(anyhow!("second-layer SSH connect failed: {}", e)))
