@@ -114,8 +114,6 @@ impl ForwardSpec {
 
     /// Whether this version knows how to run the rule. Unknown kinds (from a
     /// newer app version) are preserved in configs but skipped at runtime.
-    // Wired into the runtime guard in r7; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn is_supported(&self) -> bool {
         !matches!(&self.kind, ForwardKind::Unknown(_))
     }

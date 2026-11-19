@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use tauri::Emitter;
 use tokio::io::copy_bidirectional;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 use crate::model::{ForwardKind, PasswordResponse, TunnelConfig, TunnelState};
@@ -26,8 +26,6 @@ pub enum TunnelControl {
 /// A server-initiated `forwarded-tcpip` connection, produced when a `-R`
 /// listener on the server receives a connection. Handed from the SSH read loop
 /// to the tunnel task through an unbounded channel.
-// Temporary allow: r6 only builds the inert plumbing; r7 reads these fields.
-#[allow(dead_code)]
 pub(crate) struct ForwardedConn {
     pub listen_addr: String,
     pub listen_port: u16,
@@ -141,6 +139,146 @@ struct EstablishedSession {
     forward_rx: Option<mpsc::UnboundedReceiver<ForwardedConn>>,
 }
 
+// ─── Remote-forward support (-R) ──────────────────────────────────────────────
+
+/// Max time to wait for the server to acknowledge a tcpip-forward request.
+/// russh has no built-in timeout; without this a black-holed session would
+/// leave the tunnel stuck on "Connecting" forever.
+const TCPIP_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max time to wait for a cancel_tcpip_forward acknowledgement. Cleanup must
+/// not hang: closing the connection revokes server-side listeners anyway.
+const TCPIP_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A failed tcpip-forward request, before user-facing classification.
+enum TcpipForwardErr {
+    TimedOut,
+    Russh(russh::Error),
+}
+
+/// A successfully requested server-side listener. `listen_addr`/`listen_port`
+/// are what the server reports back, i.e. what incoming forwarded-tcpip
+/// connections carry; `target_*` is the local service to pump to.
+struct RemoteRoute {
+    listen_addr: String,
+    listen_port: u16,
+    target_host: String,
+    target_port: u16,
+}
+
+/// Join handles for tasks owned by one connection attempt. Drop aborts them:
+/// every early-return path must stop listeners/dispatchers instead of
+/// detaching them (M1 — a leaked listener keeps a port occupied and turns
+/// every later reconnect into a bind failure).
+struct TaskSet(Vec<tokio::task::JoinHandle<()>>);
+
+impl TaskSet {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.0.push(handle);
+    }
+
+    /// Abort every registered task and forget them. Idempotent; a second call
+    /// (e.g. from Drop after the normal cleanup path) is a no-op.
+    fn abort_all(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for TaskSet {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
+/// Map a failed tcpip-forward request to the tunnel error taxonomy (B3).
+/// A server-side refusal is permanent for this config (port taken or remote
+/// forwarding disabled) → Fatal, no reconnect. Session-level failures and
+/// timeouts are network-class → Retriable.
+fn classify_tcpip_forward_err(port: u16, err: TcpipForwardErr) -> ConnectError {
+    match err {
+        TcpipForwardErr::TimedOut => ConnectError::Retriable(anyhow!(
+            "申请远端转发监听超时（端口 {}，{}s）",
+            port,
+            TCPIP_FORWARD_TIMEOUT.as_secs()
+        )),
+        TcpipForwardErr::Russh(russh::Error::RequestDenied) => ConnectError::Fatal(format!(
+            "远端端口 {} 被服务器拒绝（可能被占用或未开放转发），已停止",
+            port
+        )),
+        TcpipForwardErr::Russh(e) => {
+            ConnectError::Retriable(anyhow!("申请远端转发端口 {} 失败: {}", port, e))
+        }
+    }
+}
+
+/// Best-effort cancel of the listeners already granted during this attempt.
+/// Uses the actual (server-reported) port, which matters for `-R 0`.
+async fn cancel_remote_forwards(
+    session: &russh::client::Handle<SshClientHandler>,
+    applied: &[(String, u32)],
+) {
+    for (addr, port) in applied {
+        match tokio::time::timeout(
+            TCPIP_CANCEL_TIMEOUT,
+            session.cancel_tcpip_forward(addr.as_str(), *port),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("cancel_tcpip_forward {}:{} failed: {}", addr, port, e),
+            Err(_) => tracing::warn!("cancel_tcpip_forward {}:{} timed out", addr, port),
+        }
+    }
+}
+
+/// Pump one forwarded connection to its local target. Errors only close this
+/// one connection; they never signal session death (handler Drop handles that).
+async fn pump_forwarded(conn: ForwardedConn, host: String, port: u16) {
+    let mut tcp = match TcpStream::connect((host.as_str(), port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Remote forward: cannot connect to local target {}:{}: {}",
+                host,
+                port,
+                e
+            );
+            return; // dropping `conn` closes the server-side channel
+        }
+    };
+    let mut ssh_stream = conn.channel.into_stream();
+    if let Err(e) = copy_bidirectional(&mut tcp, &mut ssh_stream).await {
+        tracing::debug!("remote forward pump ended: {}", e);
+    }
+}
+
+/// Abort this attempt's tasks, cancel granted server listeners, close the
+/// session, and hand back the bind error. Used when any listener fails to
+/// bind after other tasks were already spawned (M1).
+async fn cleanup_failed_bind(
+    tasks: &mut TaskSet,
+    session: &Arc<TokioMutex<russh::client::Handle<SshClientHandler>>>,
+    applied: &[(String, u32)],
+    bind: &str,
+    err: std::io::Error,
+) -> ConnectError {
+    tasks.abort_all();
+    {
+        let sess = session.lock().await;
+        cancel_remote_forwards(&sess, applied).await;
+        let _ = sess
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+    }
+    ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, err))
+}
+
 // ─── Main tunnel loop ─────────────────────────────────────────────────────────
 
 /// Spawned once per tunnel. Handles connect → auth → forward → disconnect → reconnect.
@@ -237,6 +375,15 @@ async fn connect_and_forward(
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
 ) -> Result<(), ConnectError> {
+    // Rules whose kind this version does not understand (written by a newer
+    // app) are preserved in the config but cannot run. If nothing can run at
+    // all, fail loudly and stop: a red light is honest, a fake green is not.
+    if config.forwards.iter().all(|f| !f.is_supported()) {
+        return Err(ConnectError::Fatal(
+            "该隧道没有可用的转发规则（可能来自更高版本），请升级应用".into(),
+        ));
+    }
+
     // Establishing the session (TCP connect, jump-host key/password auth, and
     // any second-layer target-host auth) can block for a long time — most
     // notably the password/keyboard-interactive prompt, which waits up to 5
@@ -248,7 +395,7 @@ async fn connect_and_forward(
     // establishment against `control_rx` makes Stop/Reconnect take effect
     // immediately at any point up through "Connected".
     let EstablishedSession {
-        handle: session,
+        handle: mut session,
         disconnect_rx,
         forward_rx,
     } = tokio::select! {
@@ -269,20 +416,103 @@ async fn connect_and_forward(
         }
     };
 
-    // Inert until r7 wires tcpip_forward + dispatch; keeping the receiver
-    // alive prevents the sender side from erroring on early channel pushes.
-    let _ = &forward_rx;
+    // ── Ask the server for every -R listener before turning green. Green
+    // means "the server accepts connections on every requested port"; a
+    // partial success would be a lie. Requests run in rule order. On any
+    // failure, cancel the already-granted listeners, close the session (which
+    // also drops the handler task), then return the classified error.
+    let mut applied: Vec<(String, u32)> = Vec::new();
+    let mut routes: Vec<RemoteRoute> = Vec::new();
+    let mut allocated_dynamic: Vec<(String, u16)> = Vec::new();
+    for forward in &config.forwards {
+        if forward.kind != ForwardKind::Remote {
+            continue;
+        }
+        // None → the safe loopback default; Some("") keeps OpenSSH's
+        // "all interfaces" spelling and is passed through verbatim.
+        let addr = forward
+            .remote_bind
+            .clone()
+            .unwrap_or_else(|| "localhost".to_string());
+        let requested = forward.listen_port();
+        let result = tokio::time::timeout(
+            TCPIP_FORWARD_TIMEOUT,
+            session.tcpip_forward(addr.as_str(), requested as u32),
+        )
+        .await;
 
-    // Both hops verified — now green.
+        let failure = match result {
+            Ok(Ok(allocated)) => {
+                // -R 0: the server reports the port it picked; otherwise the
+                // reply carries 0 and our requested port is authoritative.
+                let actual = if requested != 0 {
+                    requested as u32
+                } else {
+                    allocated
+                };
+                applied.push((addr.clone(), actual));
+                match u16::try_from(actual) {
+                    Ok(actual_port) => {
+                        if requested == 0 {
+                            allocated_dynamic.push((addr.clone(), actual_port));
+                        }
+                        routes.push(RemoteRoute {
+                            listen_addr: addr.clone(),
+                            listen_port: actual_port,
+                            target_host: forward.remote_host.clone(),
+                            target_port: forward.remote_port,
+                        });
+                        None
+                    }
+                    // Not representable in a u16 — treat as an internal error
+                    // but still cancel the grant we just received.
+                    Err(_) => Some(ConnectError::Retriable(anyhow!(
+                        "服务器分配的远端端口超出范围: {}",
+                        actual
+                    ))),
+                }
+            }
+            Ok(Err(e)) => Some(classify_tcpip_forward_err(
+                requested,
+                TcpipForwardErr::Russh(e),
+            )),
+            Err(_) => Some(classify_tcpip_forward_err(
+                requested,
+                TcpipForwardErr::TimedOut,
+            )),
+        };
+
+        if let Some(err) = failure {
+            cancel_remote_forwards(&session, &applied).await;
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            return Err(err);
+        }
+    }
+
+    // Both hops verified and every server-side listener granted — now green.
     update_state(state_map, &config.id, TunnelState::Connected);
     emit_state(app, &config.id, &TunnelState::Connected);
+
+    // Announce server-assigned ports only after every rule succeeded, so a
+    // later failure can never leave a misleading "port X" notice behind.
+    for (addr, port) in &allocated_dynamic {
+        let shown_addr = if addr.is_empty() { "0.0.0.0" } else { addr.as_str() };
+        emit_notice(
+            app,
+            &config.id,
+            "success",
+            &format!("服务器已分配远端端口 {}:{}", shown_addr, port),
+        );
+    }
 
     // Wrap session for sharing between listener tasks
     let session = Arc::new(TokioMutex::new(session));
 
     // session_error_notify: any listener task signals session death here
     let session_error = Arc::new(tokio::sync::Notify::new());
-    let mut listener_handles = Vec::new();
+    let mut tasks = TaskSet::new();
 
     for forward in &config.forwards {
         let bind_addr = if config.bind_all { "0.0.0.0" } else { "127.0.0.1" };
@@ -291,9 +521,14 @@ async fn connect_and_forward(
             ForwardKind::Local => {
                 let bind = format!("{}:{}", bind_addr, forward.local_port);
 
-                let listener = TcpListener::bind(&bind)
-                    .await
-                    .map_err(|e| ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, e)))?;
+                let listener = match TcpListener::bind(&bind).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Err(
+                            cleanup_failed_bind(&mut tasks, &session, &applied, &bind, e).await,
+                        )
+                    }
+                };
 
                 tracing::info!("Listening on {} → {}:{}", bind, forward.remote_host, forward.remote_port);
 
@@ -342,7 +577,7 @@ async fn connect_and_forward(
                     }
                 });
 
-                listener_handles.push(h);
+                tasks.push(h);
             }
             ForwardKind::Dynamic => {
                 // Dynamic rules get a local SOCKS5 proxy instead of a fixed
@@ -351,16 +586,21 @@ async fn connect_and_forward(
                 // its handle joins the same abort list.
                 let bind = format!("{}:{}", bind_addr, forward.listen_port());
 
-                let listener = TcpListener::bind(&bind)
-                    .await
-                    .map_err(|e| ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, e)))?;
+                let listener = match TcpListener::bind(&bind).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Err(
+                            cleanup_failed_bind(&mut tasks, &session, &applied, &bind, e).await,
+                        )
+                    }
+                };
 
                 tracing::info!("SOCKS5 proxy listening on {}", bind);
 
                 let session = session.clone();
                 let notify = session_error.clone();
                 let h = tokio::spawn(socks::serve_dynamic(listener, session, notify));
-                listener_handles.push(h);
+                tasks.push(h);
             }
             // Remote rules create no local listener; the server-side listener
             // is requested before "Connected" and dispatched by the -R task.
@@ -375,6 +615,35 @@ async fn connect_and_forward(
         }
     }
 
+    // Dispatch server-pushed forwarded-tcpip connections to their local
+    // targets. Spawned after the establishment race (invariant 1) and owned by
+    // TaskSet. Per-connection pumps are independent tasks: the dispatch loop
+    // never waits on IO beyond the channel itself.
+    if let Some(mut rx) = forward_rx {
+        let routes = Arc::new(routes);
+        let h = tokio::spawn(async move {
+            while let Some(conn) = rx.recv().await {
+                match routes.iter().find(|r| {
+                    r.listen_addr == conn.listen_addr && r.listen_port == conn.listen_port
+                }) {
+                    Some(route) => {
+                        let host = route.target_host.clone();
+                        let port = route.target_port;
+                        tokio::spawn(pump_forwarded(conn, host, port));
+                    }
+                    // Address normalization drift or a grant we no longer
+                    // track: drop the channel rather than guess a target.
+                    None => tracing::warn!(
+                        "forwarded-tcpip for unknown listener {}:{}",
+                        conn.listen_addr,
+                        conn.listen_port
+                    ),
+                }
+            }
+        });
+        tasks.push(h);
+    }
+
     // Wait: Stop/Reconnect control | SSH disconnect | listener error
     let mut drx = disconnect_rx;
     let result = tokio::select! {
@@ -386,12 +655,13 @@ async fn connect_and_forward(
         _ = session_error.notified() => Err(ConnectError::Retriable(anyhow!("SSH channel error"))),
     };
 
-    // Cleanup
-    for h in &listener_handles {
-        h.abort();
-    }
+    // Cleanup: stop accepting (listeners + dispatch), cancel the server-side
+    // listeners using their actual ports (crucial for -R 0), then disconnect.
+    // Cancelling is best-effort: closing the session revokes them regardless.
+    tasks.abort_all();
     {
         let sess = session.lock().await;
+        cancel_remote_forwards(&sess, &applied).await;
         let _ = sess.disconnect(russh::Disconnect::ByApplication, "", "en").await;
     }
 
@@ -1028,4 +1298,100 @@ fn key_paths(identity_file: Option<&str>) -> Vec<String> {
         .iter()
         .map(|name| home.join(".ssh").join(name).to_string_lossy().to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // ─── tcpip-forward error classification (B3) ─────────────────────────────
+
+    #[test]
+    fn request_denied_is_fatal_with_port() {
+        match classify_tcpip_forward_err(8080, TcpipForwardErr::Russh(russh::Error::RequestDenied))
+        {
+            ConnectError::Fatal(msg) => {
+                assert!(msg.contains("8080"), "message should name the port: {}", msg)
+            }
+            ConnectError::Retriable(e) => panic!("expected Fatal, got Retriable: {}", e),
+        }
+    }
+
+    #[test]
+    fn disconnect_error_is_retriable() {
+        assert!(matches!(
+            classify_tcpip_forward_err(8080, TcpipForwardErr::Russh(russh::Error::Disconnect)),
+            ConnectError::Retriable(_)
+        ));
+    }
+
+    #[test]
+    fn timeout_is_retriable() {
+        assert!(matches!(
+            classify_tcpip_forward_err(8080, TcpipForwardErr::TimedOut),
+            ConnectError::Retriable(_)
+        ));
+    }
+
+    // ─── TaskSet (M1) ────────────────────────────────────────────────────────
+
+    /// Sets an observable flag when the owning task's future is dropped, which
+    /// is what aborting a tokio task does.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn wait_for_flag(flag: &AtomicBool) -> bool {
+        for _ in 0..100 {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn spawn_flagged_task(flag: &Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+        let flag = flag.clone();
+        tokio::spawn(async move {
+            let _guard = DropFlag(flag);
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test]
+    async fn taskset_drop_aborts_registered_tasks() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut tasks = TaskSet::new();
+            tasks.push(spawn_flagged_task(&flag));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !flag.load(Ordering::SeqCst),
+                "task should still be running before the set is dropped"
+            );
+        }
+        assert!(
+            wait_for_flag(&flag).await,
+            "dropping the TaskSet must abort its tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn taskset_abort_all_is_idempotent() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut tasks = TaskSet::new();
+        tasks.push(spawn_flagged_task(&flag));
+        // Let the task actually start (and construct its Drop guard) so the
+        // assertions below observe cancellation, not "never polled".
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tasks.abort_all();
+        tasks.abort_all();
+        assert!(wait_for_flag(&flag).await);
+    }
 }
