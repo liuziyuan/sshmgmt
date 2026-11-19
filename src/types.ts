@@ -1,7 +1,11 @@
+export type ForwardKind = "local" | "dynamic";
+
 export interface ForwardSpec {
   local_port: number;
   remote_host: string;
   remote_port: number;
+  /** Rule kind; the backend always serializes it (older JSON defaults to local). */
+  kind: ForwardKind;
 }
 
 export interface TunnelConfig {

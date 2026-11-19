@@ -126,7 +126,11 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
               <Row
                 key={i}
                 label={`转发 ${i + 1}`}
-                value={`本地 :${f.local_port} → ${f.remote_host}:${f.remote_port}`}
+                value={
+                  f.kind === "dynamic"
+                    ? `本地 :${f.local_port} → SOCKS 代理（跳板侧解析域名）`
+                    : `本地 :${f.local_port} → ${f.remote_host}:${f.remote_port}`
+                }
               />
             ))}
             {preview.bind_all && (

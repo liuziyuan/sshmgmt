@@ -88,9 +88,12 @@ function matchesQuery(t: TunnelInfo, q: string): boolean {
     // Search environments case-insensitively in both directions.
     t.config.environment?.toUpperCase(),
     t.config.jump_host,
-    ...t.config.forwards.map((f) => f.remote_host),
     ...t.config.forwards.map((f) => String(f.local_port)),
-    ...t.config.forwards.map((f) => String(f.remote_port)),
+    // Dynamic rules carry ""/0 placeholders — searching them would let "0"
+    // match every SOCKS rule, so only Local targets contribute.
+    ...t.config.forwards
+      .filter((f) => f.kind !== "dynamic")
+      .flatMap((f) => [f.remote_host, String(f.remote_port)]),
   ];
   return fields.some((s) => s && s.toLowerCase().includes(q));
 }
@@ -244,7 +247,7 @@ export default function TunnelList({
       <td style={td}>
         {t.config.forwards.map((f) => (
           <div key={f.local_port} style={{ fontSize: 12, color: "#d1d5db" }}>
-            {f.remote_host}:{f.remote_port}
+            {f.kind === "dynamic" ? "SOCKS 代理" : `${f.remote_host}:${f.remote_port}`}
           </div>
         ))}
       </td>
