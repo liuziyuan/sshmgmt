@@ -35,6 +35,12 @@ pub async fn parse_command(raw: String) -> Result<TunnelConfig, String> {
     parse_ssh_command(&raw, None).map_err(|e| e.to_string())
 }
 
+/// Warning produced by the legacy data-dir migration at startup, if any.
+#[tauri::command]
+pub async fn get_startup_warning() -> Option<String> {
+    store::startup_warning()
+}
+
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
 #[tauri::command]

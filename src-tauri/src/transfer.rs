@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn read_import_rejects_wrong_format() {
-        let dir = std::env::temp_dir().join("sshmgmt-transfer-tests");
+        let dir = std::env::temp_dir().join("portunnel-transfer-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wrong-format.json");
         std::fs::write(
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn read_import_rejects_future_version() {
-        let dir = std::env::temp_dir().join("sshmgmt-transfer-tests");
+        let dir = std::env::temp_dir().join("portunnel-transfer-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("future-version.json");
         std::fs::write(

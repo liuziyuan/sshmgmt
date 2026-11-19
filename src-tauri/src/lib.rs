@@ -24,9 +24,17 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sshmgmt=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("portunnel=debug")),
         )
         .init();
+
+    // Earliest possible point: must precede load_tunnels() and any save_*(),
+    // because both create the config dir and would defeat the three-state
+    // legacy-dir check.
+    if let Some(warning) = store::migrate_legacy_data_dir() {
+        tracing::warn!("legacy data dir migration: {}", warning);
+        store::set_startup_warning(warning);
+    }
 
     let mut tunnels = load_tunnels();
     migrate_env_case(&mut tunnels);
@@ -59,6 +67,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_tunnels,
+            commands::get_startup_warning,
             commands::parse_command,
             commands::add_tunnel,
             commands::update_tunnel,

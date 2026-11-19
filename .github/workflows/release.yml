@@ -64,8 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'sshmgmt ${{ github.ref_name }}'
-          releaseBody: '下载下方对应平台的安装包。macOS 未签名，首次打开请右键「打开」或执行 xattr -dr com.apple.quarantine /Applications/sshmgmt.app'
+          releaseName: 'portunnel ${{ github.ref_name }}'
+          releaseBody: 'portunnel（由 sshmgmt 更名而来）：升级后配置与密码自动延续。下载下方对应平台的安装包；如安装过旧版 sshmgmt，建议卸载旧版（新旧并存配置各自独立、会各自分叉（钥匙串密码为二者共用））。macOS 未签名，首次打开请右键「打开」或执行 xattr -dr com.apple.quarantine /Applications/portunnel.app'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
