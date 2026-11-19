@@ -203,6 +203,23 @@ export function formToCommand(s: EditorFormState): FormToCommandResult {
   return { ok: true, command: parts.join(" ") };
 }
 
+// True when the user hasn't touched any field that carries intent. A pristine
+// form (fresh "new tunnel" dialog) switching to the command tab is a normal
+// move, not a failure: there is simply nothing to convert yet.
+export function isFormBlank(s: EditorFormState): boolean {
+  return (
+    s.jumpUser.trim() === "" &&
+    s.jumpHost.trim() === "" &&
+    !s.bindAll &&
+    s.identityFile.trim() === "" &&
+    s.forwards.every((f) =>
+      f.localPort.trim() === "" &&
+      f.remoteHost.trim() === "" &&
+      f.remotePort.trim() === "",
+    )
+  );
+}
+
 // Back-fill from an existing config (edit mode). Structured fields only,
 // never re-parsing raw_command; ports converted with String(); jump host
 // goes through stripHostBrackets defensively so a legacy bracketed value

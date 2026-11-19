@@ -11,6 +11,7 @@ import {
   EMPTY_FORM_STATE,
   configToFormState,
   formToCommand,
+  isFormBlank,
   stripHostBrackets,
   validateFormState,
   type EditorFormState,
@@ -82,6 +83,11 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
     isEdit ? configToFormState(editTarget.config) : EMPTY_FORM_STATE,
   );
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Inline explanation shown under the command box when a partially filled
+  // form cannot be converted. Deliberately not a global banner: switching tabs
+  // is a normal navigation, and a persistent yellow banner for it reads like
+  // something went wrong.
+  const [commandNote, setCommandNote] = useState("");
 
   // Per-render validation for red hints and the save button.
   const formErrors = validateFormState(formState);
@@ -135,6 +141,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
     setActiveTab(tab);
     writeStoredTab(tab);
     if (tab === "form") {
+      setCommandNote("");
       // Empty command is not a failure: keep the form as-is.
       if (!rawCommand.trim()) return;
       const seq = ++switchSeqRef.current;
@@ -170,8 +177,15 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
       const r = formToCommand(formState);
       if (r.ok) {
         setRawCommand(r.command);
+        setCommandNote("");
+      } else if (isFormBlank(formState)) {
+        // Fresh dialog, nothing typed yet: leave the command box untouched,
+        // no hint needed — the user is about to paste.
+        setCommandNote("");
       } else {
-        notify("warn", "表单信息不完整，已保留原命令内容");
+        setCommandNote(
+          "表单还没填完整，暂时无法生成命令；命令框里保留的是原有内容，可以直接继续编辑或重新粘贴。"
+        );
       }
     }
   }
@@ -260,7 +274,12 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
 
   return (
     <Overlay onClose={onClose}>
-      <div style={{ width: 640, maxHeight: "90vh", overflowY: "auto" }}>
+      <div style={{
+        width: 640, maxWidth: "100%", maxHeight: "90vh",
+        // Vertical-only scroller: overflow-x hidden keeps long preview values
+        // from turning the modal into a horizontally scrolling box.
+        overflowY: "auto", overflowX: "hidden", overscrollBehavior: "contain",
+      }}>
         <h2 style={{ marginTop: 0, marginBottom: 16 }}>
           {isEdit ? "编辑隧道" : "新增隧道"}
         </h2>
@@ -403,7 +422,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
             <label style={labelStyle}>ssh 命令</label>
             <textarea
               value={rawCommand}
-              onChange={(e) => setRawCommand(e.target.value)}
+              onChange={(e) => { setRawCommand(e.target.value); setCommandNote(""); }}
               placeholder="粘贴 ssh 命令，例如：ssh -fNg -L 10008:host:3306 user@jump"
               style={{
                 width: "100%", height: 80, fontFamily: "monospace", fontSize: 13,
@@ -411,6 +430,12 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
                 borderRadius: 6, padding: 10, resize: "vertical", boxSizing: "border-box",
               }}
             />
+
+            {commandNote && (
+              <div style={{ color: "#fbbf24", fontSize: 12, marginTop: 6 }}>
+                {commandNote}
+              </div>
+            )}
 
             {parseError && (
               <div style={{ color: "#f87171", fontSize: 12, marginTop: 4 }}>{parseError}</div>
@@ -527,8 +552,8 @@ function describeForward(f: ForwardSpec): string {
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
-      <span style={{ color: "#6b7280", minWidth: 70 }}>{label}:</span>
-      <span style={{ color: "#e5e7eb" }}>{value}</span>
+      <span style={{ color: "#6b7280", minWidth: 70, flexShrink: 0 }}>{label}:</span>
+      <span style={{ color: "#e5e7eb", minWidth: 0, overflowWrap: "anywhere" }}>{value}</span>
     </div>
   );
 }
@@ -558,7 +583,8 @@ export function Overlay({ children }: { children: React.ReactNode; onClose?: () 
       <div style={{
         backgroundColor: "#1e2433", borderRadius: 10, padding: 24,
         border: "1px solid #374151", boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
-        minWidth: 400,
+        minWidth: 400, maxWidth: "calc(100vw - 32px)",
+        maxHeight: "calc(100vh - 32px)",
       }}>
         {children}
       </div>

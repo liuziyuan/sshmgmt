@@ -191,11 +191,16 @@ export default function App() {
 
   return (
     <div style={{
-      minHeight: "100vh", backgroundColor: "#111827", color: "#f9fafb",
+      // Fixed-viewport column: header and banners never scroll, only <main>
+      // does. This keeps the title/actions bar pinned as a permanent top bar
+      // and stops the whole document from scrolling behind it.
+      height: "100vh", display: "flex", flexDirection: "column",
+      overflow: "hidden", backgroundColor: "#111827", color: "#f9fafb",
       fontFamily: "system-ui, -apple-system, sans-serif",
     }}>
-      {/* Header */}
+      {/* Header (never scrolls) */}
       <header style={{
+        flexShrink: 0,
         backgroundColor: "#1e2433", borderBottom: "1px solid #374151",
         padding: "14px 24px", display: "flex", alignItems: "center",
         justifyContent: "space-between",
@@ -226,7 +231,7 @@ export default function App() {
         <Banner key={b.id} level={b.level} message={b.message} onClose={() => dismissBanner(b.id)} />
       ))}
 
-      <main style={{ padding: "24px" }}>
+      <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "24px" }}>
         <TunnelList
           tunnels={tunnels}
           groupOrder={groupOrder}
@@ -282,6 +287,7 @@ function Banner({ level, message, onClose }: { level: BannerLevel; message: stri
   const s = BANNER_STYLE[level];
   return (
     <div style={{
+      flexShrink: 0,
       backgroundColor: s.bg, borderBottom: `1px solid ${s.border}`,
       padding: "10px 24px", fontSize: 13, color: s.fg,
       display: "flex", justifyContent: "space-between", alignItems: "center",
