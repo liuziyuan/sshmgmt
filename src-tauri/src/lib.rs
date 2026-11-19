@@ -3,7 +3,7 @@ mod manager;
 mod model;
 mod parser;
 mod probe;
-pub mod socks;
+pub(crate) mod socks;
 mod store;
 mod transfer;
 mod tunnel;

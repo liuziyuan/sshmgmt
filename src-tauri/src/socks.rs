@@ -170,11 +170,19 @@ pub enum Reply {
     Succeeded = 0x00,
     GeneralFailure = 0x01,
     NotAllowed = 0x02,
+    // The four codes below are part of the protocol surface but never emitted
+    // by this implementation (targets are resolved by the jump host, so local
+    // network/host/TTL conditions do not arise, and unsupported address types
+    // are reported as general failure). Kept so the enum mirrors RFC 1928.
+    #[allow(dead_code)]
     NetworkUnreachable = 0x03,
+    #[allow(dead_code)]
     HostUnreachable = 0x04,
     ConnectionRefused = 0x05,
+    #[allow(dead_code)]
     TtlExpired = 0x06,
     CommandNotSupported = 0x07,
+    #[allow(dead_code)]
     AddressTypeNotSupported = 0x08,
 }
 
@@ -210,6 +218,38 @@ pub fn russh_error_to_reply(err: &russh::Error) -> Reply {
     }
 }
 
+/// How a failed `direct-tcpip` channel open should be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelErrorKind {
+    /// The SSH session is healthy; only this one target refused/failed.
+    /// Fail the SOCKS request, never the tunnel.
+    Target,
+    /// The SSH session itself looks dead; the tunnel should reconnect.
+    Session,
+}
+
+/// Classify a `channel_open_direct_tcpip` error.
+///
+/// A server-issued `CHANNEL_OPEN_FAILURE` (target refused, admin-prohibited,
+/// resource shortage, unknown channel type) means the target is unreachable
+/// or refused — the session is fine. Notifying the tunnel task in that case
+/// would tear down every listener and force a reconnect (or a red light when
+/// auto-reconnect is off) for a routine per-request failure such as a closed
+/// target port, which is exactly the S1 review finding.
+///
+/// Only explicitly recognized session-level errors notify. Anything not
+/// recognized defaults to `Target`: session death is independently detected
+/// by the handler's Drop signal, so a missed notification cannot leave a dead
+/// session unnoticed, while a false notification would kill a healthy tunnel.
+pub fn classify_channel_error(err: &russh::Error) -> ChannelErrorKind {
+    match err {
+        russh::Error::Disconnect | russh::Error::SendError | russh::Error::HUP => {
+            ChannelErrorKind::Session
+        }
+        _ => ChannelErrorKind::Target,
+    }
+}
+
 // ─── Serving dynamic forwards ────────────────────────────────────────────────
 
 /// Time budget for a client to finish the greeting + request handshake.
@@ -218,8 +258,8 @@ pub fn russh_error_to_reply(err: &russh::Error) -> Reply {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Accept loop for one `-D` listener. Each client is served on its own task;
-/// a failed `direct-tcpip` open signals `session_error` so the tunnel task
-/// treats it like the `-L` path does (session likely dead → reconnect).
+/// only a session-level channel error signals `session_error` — a target-level
+/// failure (server refused that destination) fails just the SOCKS request.
 ///
 /// Generic over the russh handler so this module stays decoupled from
 /// tunnel.rs. The listener task is spawned by the caller outside the
@@ -336,9 +376,12 @@ where
         Err(e) => {
             tracing::warn!("SOCKS channel to {}:{} failed: {}", target, request.port, e);
             let _ = tcp.write_all(&reply(russh_error_to_reply(&e))).await;
-            // Same signal as the -L path: a session that cannot open channels
-            // is treated as dead and triggers the backoff reconnect.
-            session_error.notify_one();
+            // A refused/unreachable target is not a dead session: fail only
+            // this request. Only recognized session-level errors wake the
+            // tunnel task (the -L path keeps its existing notify unchanged).
+            if classify_channel_error(&e) == ChannelErrorKind::Session {
+                session_error.notify_one();
+            }
         }
     }
 
@@ -528,6 +571,54 @@ mod tests {
         assert_eq!(
             russh_error_to_reply(&russh::Error::Disconnect),
             Reply::GeneralFailure
+        );
+    }
+
+    #[test]
+    fn channel_open_failure_is_target_level_not_session_death() {
+        use russh::ChannelOpenFailure;
+
+        // Every server-issued CHANNEL_OPEN_FAILURE means "this target refused
+        // or is unreachable" — the SSH session must survive (S1 regression).
+        for cause in [
+            ChannelOpenFailure::ConnectFailed,
+            ChannelOpenFailure::AdministrativelyProhibited,
+            ChannelOpenFailure::ResourceShortage,
+            ChannelOpenFailure::UnknownChannelType,
+            ChannelOpenFailure::Unknown,
+        ] {
+            assert_eq!(
+                classify_channel_error(&russh::Error::ChannelOpenFailure(cause)),
+                ChannelErrorKind::Target,
+                "cause: {:?}",
+                cause
+            );
+        }
+    }
+
+    #[test]
+    fn session_level_errors_wake_the_tunnel() {
+        for err in [
+            russh::Error::Disconnect,
+            russh::Error::SendError,
+            russh::Error::HUP,
+        ] {
+            assert_eq!(
+                classify_channel_error(&err),
+                ChannelErrorKind::Session,
+                "err: {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_channel_errors_default_to_target_level() {
+        // Fail only the request; real session death is still caught by the
+        // handler's Drop signal, so a missed wake-up cannot hide a dead session.
+        assert_eq!(
+            classify_channel_error(&russh::Error::Version),
+            ChannelErrorKind::Target
         );
     }
 }
