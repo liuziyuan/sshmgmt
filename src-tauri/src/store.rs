@@ -76,13 +76,46 @@ pub fn save_group_order(order: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Parse the persisted tunnel list tolerantly: a single corrupt entry must not
+/// discard the rest of the file (a whole-list fallback would silently drop
+/// every tunnel and then persist that loss on the next save). A file that is
+/// not a JSON array at all still falls back to an empty list — same as before.
+fn parse_tunnels(data: &str) -> Vec<TunnelConfig> {
+    let values: Vec<serde_json::Value> = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse tunnels.json, starting with an empty list: {}", e);
+            return Vec::new();
+        }
+    };
+    let total = values.len();
+    let tunnels: Vec<TunnelConfig> = values
+        .into_iter()
+        .filter_map(|v| match serde_json::from_value::<TunnelConfig>(v) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("Skipping invalid tunnel entry: {}", e);
+                None
+            }
+        })
+        .collect();
+    if tunnels.len() != total {
+        tracing::warn!(
+            "Loaded {} of {} tunnel entries (corrupt entries skipped)",
+            tunnels.len(),
+            total
+        );
+    }
+    tunnels
+}
+
 pub fn load_tunnels() -> Vec<TunnelConfig> {
     let path = tunnels_path();
     if !path.exists() {
         return Vec::new();
     }
     match std::fs::read_to_string(&path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Ok(data) => parse_tunnels(&data),
         Err(e) => {
             tracing::warn!("Failed to read tunnels.json: {}", e);
             Vec::new()
@@ -149,4 +182,75 @@ pub fn set_target_user(host: &str, port: u16, user: &str) -> Result<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, &account)?;
     entry.set_password(user)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ForwardKind;
+    use serde_json::json;
+
+    fn valid_tunnel(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "name": "t",
+            "raw_command": "ssh -L 1:h:2 j",
+            "jump_user": "u",
+            "jump_host": "j",
+            "jump_port": 22,
+            "forwards": [{"local_port": 1, "remote_host": "h", "remote_port": 2}],
+            "bind_all": false,
+            "identity_file": null,
+            "auto_reconnect": true
+        })
+    }
+
+    /// L8: one corrupt entry is skipped, the rest of the list survives.
+    #[test]
+    fn parse_tunnels_keeps_valid_entries_when_one_is_bad() {
+        let data = json!([
+            valid_tunnel("a"),
+            {"id": "broken"},
+            valid_tunnel("b")
+        ])
+        .to_string();
+
+        let tunnels = parse_tunnels(&data);
+        assert_eq!(tunnels.len(), 2);
+        assert_eq!(tunnels[0].id, "a");
+        assert_eq!(tunnels[1].id, "b");
+    }
+
+    #[test]
+    fn parse_tunnels_preserves_unknown_kind() {
+        let mut t = valid_tunnel("a");
+        t["forwards"] = json!([{
+            "local_port": 1,
+            "remote_host": "h",
+            "remote_port": 2,
+            "kind": "socks-udp"
+        }]);
+        let tunnels = parse_tunnels(&json!([t]).to_string());
+
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(
+            tunnels[0].forwards[0].kind,
+            ForwardKind::Unknown("socks-udp".into())
+        );
+    }
+
+    #[test]
+    fn parse_tunnels_rejects_non_array() {
+        assert!(parse_tunnels(r#"{"not":"an array"}"#).is_empty());
+        assert!(parse_tunnels("not json").is_empty());
+    }
+
+    #[test]
+    fn parse_tunnels_reads_legacy_without_kind() {
+        let tunnels = parse_tunnels(&json!([valid_tunnel("a")]).to_string());
+
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].forwards[0].kind, ForwardKind::Local);
+        assert_eq!(tunnels[0].forwards[0].remote_bind, None);
+    }
 }
