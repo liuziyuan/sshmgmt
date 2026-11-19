@@ -142,6 +142,16 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
       parseCommand(rawCommand)
         .then((cfg) => {
           if (seq !== switchSeqRef.current) return;
+          // A parsed command the form cannot express (multi-hop / -D / -R)
+          // must never back-fill: saving the form would silently rewrite it
+          // as a single-hop -L tunnel. Stay on the command tab instead.
+          if (!canEditInForm(cfg)) {
+            pendingBackfillRef.current = null;
+            notify("warn", "该命令包含表单无法表达的内容（多跳 / -D / -R），请使用「粘贴命令」编辑");
+            setActiveTab("command");
+            writeStoredTab("command");
+            return;
+          }
           if (pendingBackfillRef.current !== seq) {
             // The user edited the form while the parse IPC was in flight:
             // back-fill is voided and their input is kept (review G2).
