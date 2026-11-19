@@ -21,6 +21,11 @@ pub const EXPORT_VERSION: u32 = 1;
 pub struct TunnelSecret {
     pub password: Option<String>,
     pub target_user: Option<String>,
+    /// Per-hop passwords in hop order (index-aligned with `config.hops`).
+    /// Absent in older export files → empty list; the legacy `password` field
+    /// still carries the first hop's password for those files.
+    #[serde(default)]
+    pub hop_passwords: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,12 +57,28 @@ pub fn build_export(tunnels: &[TunnelConfig]) -> ExportFile {
         .unwrap_or(0);
     let tunnels = tunnels
         .iter()
-        .map(|c| ExportedTunnel {
-            secret: TunnelSecret {
-                password: store::get_password(&c.jump_user, &c.jump_host, c.jump_port),
-                target_user: store::get_target_user(&c.jump_host, c.jump_port),
-            },
-            config: c.clone(),
+        .map(|c| {
+            let hops = c.resolved_hops();
+            let hop_passwords = hops
+                .iter()
+                .map(|h| store::get_password(&h.user, &h.host, h.port))
+                .collect();
+            // Legacy field: the first hop's password, so a v1.4 importer still
+            // gets the entry-hop credential.
+            let password = hops
+                .first()
+                .and_then(|h| store::get_password(&h.user, &h.host, h.port));
+            let target_user = c
+                .first_hop()
+                .and_then(|h| store::get_target_user(&h.host, h.port));
+            ExportedTunnel {
+                secret: TunnelSecret {
+                    password,
+                    target_user,
+                    hop_passwords,
+                },
+                config: c.clone(),
+            }
         })
         .collect();
     ExportFile {
@@ -272,5 +293,51 @@ mod tests {
         )
         .unwrap();
         assert!(read_import(&path).is_err());
+    }
+
+    // ─── per-hop secrets (C5 / export-import) ───────────────────────────────
+
+    #[test]
+    fn secret_hop_passwords_default_empty_and_roundtrip() {
+        assert!(TunnelSecret::default().hop_passwords.is_empty());
+
+        let secret = TunnelSecret {
+            password: Some("p1".into()),
+            target_user: None,
+            hop_passwords: vec![Some("p1".into()), None],
+        };
+        let back: TunnelSecret =
+            serde_json::from_str(&serde_json::to_string(&secret).unwrap()).unwrap();
+        assert_eq!(
+            back.hop_passwords,
+            vec![Some("p1".to_string()), None]
+        );
+        assert_eq!(back.password.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn legacy_export_without_hop_passwords_parses() {
+        let secret: TunnelSecret =
+            serde_json::from_str(r#"{"password":"p","target_user":"u"}"#).unwrap();
+        assert_eq!(secret.password.as_deref(), Some("p"));
+        assert_eq!(secret.target_user.as_deref(), Some("u"));
+        assert!(secret.hop_passwords.is_empty());
+    }
+
+    #[test]
+    fn multi_hop_export_keeps_hops_order() {
+        // Structural assertion only — building an export reads the keychain.
+        let secret = TunnelSecret {
+            password: Some("first".into()),
+            target_user: None,
+            hop_passwords: vec![Some("first".into()), Some("second".into())],
+        };
+        let value = serde_json::to_value(&secret).unwrap();
+
+        assert_eq!(value["password"], "first");
+        let passwords = value["hop_passwords"].as_array().unwrap();
+        assert_eq!(passwords.len(), 2);
+        assert_eq!(passwords[0], "first");
+        assert_eq!(passwords[1], "second");
     }
 }

@@ -75,8 +75,6 @@ impl TunnelConfig {
 
     /// First hop, falling back to the legacy mirror when `hops` is absent.
     /// None only when neither source names a host.
-    // Wired into export/import in t6; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn first_hop(&self) -> Option<Hop> {
         if let Some(first) = self.hops.first() {
             return Some(first.clone());

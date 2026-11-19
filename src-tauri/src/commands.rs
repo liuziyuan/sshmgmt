@@ -210,18 +210,51 @@ pub async fn import_tunnels(
     let mut warnings = Vec::new();
     for t in &mut to_import {
         let c = &mut t.config;
+        // Configs from older files have no hops; synthesize them before any
+        // secret is written so keychain accounts match the runtime chain.
+        c.ensure_hops();
         // Imported files may predate env normalization — fold them in here
         // too, so an old export can't reintroduce "qa"/"prod" entries.
         c.environment = normalize_env(c.environment.clone());
         c.group = c.group.clone().map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+
+        let hops = c.resolved_hops();
         // Only write Some secrets — null means "not exported", never "delete".
-        if let Some(pw) = &t.secret.password {
-            if let Err(e) = store::set_password(&c.jump_user, &c.jump_host, c.jump_port, pw) {
-                warnings.push(format!("「{}」密码写入钥匙串失败: {}", c.name, e));
+        if t.secret.hop_passwords.is_empty() {
+            // Legacy export file: `password` belongs to the first hop.
+            if let (Some(pw), Some(first)) = (&t.secret.password, hops.first()) {
+                if let Err(e) = store::set_password(&first.user, &first.host, first.port, pw) {
+                    warnings.push(format!("「{}」密码写入钥匙串失败: {}", c.name, e));
+                }
+            }
+        } else {
+            for (i, pw) in t.secret.hop_passwords.iter().enumerate() {
+                let Some(pw) = pw else { continue };
+                match hops.get(i) {
+                    Some(hop) => {
+                        if let Err(e) =
+                            store::set_password(&hop.user, &hop.host, hop.port, pw)
+                        {
+                            warnings.push(format!(
+                                "「{}」第 {}/{} 跳密码写入钥匙串失败: {}",
+                                c.name,
+                                i + 1,
+                                hops.len(),
+                                e
+                            ));
+                        }
+                    }
+                    None => tracing::warn!(
+                        "hop_passwords[{}] out of range for tunnel {} ({} hops)",
+                        i,
+                        c.name,
+                        hops.len()
+                    ),
+                }
             }
         }
-        if let Some(u) = &t.secret.target_user {
-            if let Err(e) = store::set_target_user(&c.jump_host, c.jump_port, u) {
+        if let (Some(u), Some(first)) = (&t.secret.target_user, hops.first()) {
+            if let Err(e) = store::set_target_user(&first.host, first.port, u) {
                 warnings.push(format!("「{}」用户名写入钥匙串失败: {}", c.name, e));
             }
         }
@@ -300,8 +333,20 @@ pub async fn delete_saved_password(
 ) -> Result<(), String> {
     let m = mgr.lock().await;
     if let Some(c) = m.get_config(&id) {
-        store::delete_password(&c.jump_user, &c.jump_host, c.jump_port)
-            .map_err(|e| e.to_string())?;
+        // Delete every hop's saved password; report the first failure after
+        // attempting them all (single-hop keeps the old error semantics).
+        let hops = c.resolved_hops();
+        let mut first_error: Option<String> = None;
+        for hop in &hops {
+            if let Err(e) = store::delete_password(&hop.user, &hop.host, hop.port) {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
     }
     Ok(())
 }
