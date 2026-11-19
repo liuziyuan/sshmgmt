@@ -8,7 +8,8 @@ use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
-use crate::model::{PasswordResponse, TunnelConfig, TunnelState};
+use crate::model::{ForwardKind, PasswordResponse, TunnelConfig, TunnelState};
+use crate::socks;
 use crate::store;
 
 // Shared state maps, accessible from both tunnel tasks and commands
@@ -228,60 +229,83 @@ async fn connect_and_forward(
 
     for forward in &config.forwards {
         let bind_addr = if config.bind_all { "0.0.0.0" } else { "127.0.0.1" };
-        let bind = format!("{}:{}", bind_addr, forward.local_port);
 
-        let listener = TcpListener::bind(&bind)
-            .await
-            .map_err(|e| ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, e)))?;
+        match forward.kind {
+            ForwardKind::Local => {
+                let bind = format!("{}:{}", bind_addr, forward.local_port);
 
-        tracing::info!("Listening on {} → {}:{}", bind, forward.remote_host, forward.remote_port);
+                let listener = TcpListener::bind(&bind)
+                    .await
+                    .map_err(|e| ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, e)))?;
 
-        let session = session.clone();
-        let remote_host = forward.remote_host.clone();
-        let remote_port = forward.remote_port;
-        let notify = session_error.clone();
-
-        let h = tokio::spawn(async move {
-            loop {
-                let (tcp_stream, peer) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!("accept() error: {}", e);
-                        break;
-                    }
-                };
-                tracing::debug!("New connection {} → {}:{}", peer, remote_host, remote_port);
+                tracing::info!("Listening on {} → {}:{}", bind, forward.remote_host, forward.remote_port);
 
                 let session = session.clone();
-                let rhost = remote_host.clone();
-                let rport = remote_port;
-                let notify = notify.clone();
+                let remote_host = forward.remote_host.clone();
+                let remote_port = forward.remote_port;
+                let notify = session_error.clone();
 
-                tokio::spawn(async move {
-                    let ch_result = {
-                        let sess = session.lock().await;
-                        sess.channel_open_direct_tcpip(&rhost, rport as u32, "127.0.0.1", 0)
-                            .await
-                    };
-
-                    match ch_result {
-                        Ok(channel) => {
-                            let mut ssh_stream = channel.into_stream();
-                            let mut tcp = tcp_stream;
-                            if let Err(e) = copy_bidirectional(&mut tcp, &mut ssh_stream).await {
-                                tracing::debug!("pump ended: {}", e);
+                let h = tokio::spawn(async move {
+                    loop {
+                        let (tcp_stream, peer) = match listener.accept().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("accept() error: {}", e);
+                                break;
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("channel_open_direct_tcpip error: {}", e);
-                            notify.notify_one();
-                        }
+                        };
+                        tracing::debug!("New connection {} → {}:{}", peer, remote_host, remote_port);
+
+                        let session = session.clone();
+                        let rhost = remote_host.clone();
+                        let rport = remote_port;
+                        let notify = notify.clone();
+
+                        tokio::spawn(async move {
+                            let ch_result = {
+                                let sess = session.lock().await;
+                                sess.channel_open_direct_tcpip(&rhost, rport as u32, "127.0.0.1", 0)
+                                    .await
+                            };
+
+                            match ch_result {
+                                Ok(channel) => {
+                                    let mut ssh_stream = channel.into_stream();
+                                    let mut tcp = tcp_stream;
+                                    if let Err(e) = copy_bidirectional(&mut tcp, &mut ssh_stream).await {
+                                        tracing::debug!("pump ended: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("channel_open_direct_tcpip error: {}", e);
+                                    notify.notify_one();
+                                }
+                            }
+                        });
                     }
                 });
-            }
-        });
 
-        listener_handles.push(h);
+                listener_handles.push(h);
+            }
+            ForwardKind::Dynamic => {
+                // Dynamic rules get a local SOCKS5 proxy instead of a fixed
+                // target: each client picks its destination at handshake time.
+                // Spawned outside the establishment race like the -L listener;
+                // its handle joins the same abort list.
+                let bind = format!("{}:{}", bind_addr, forward.listen_port());
+
+                let listener = TcpListener::bind(&bind)
+                    .await
+                    .map_err(|e| ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, e)))?;
+
+                tracing::info!("SOCKS5 proxy listening on {}", bind);
+
+                let session = session.clone();
+                let notify = session_error.clone();
+                let h = tokio::spawn(socks::serve_dynamic(listener, session, notify));
+                listener_handles.push(h);
+            }
+        }
     }
 
     // Wait: Stop/Reconnect control | SSH disconnect | listener error
@@ -401,7 +425,10 @@ async fn establish_session(
     // is fatal (red, no reconnect). This is a connection-time action only; data
     // forwarding below still goes over the single-hop direct-tcpip path.
     for forward in &config.forwards {
-        if forward.remote_port != 22 {
+        // Only Local rules have a fixed target to pre-authenticate. Dynamic
+        // rules pick their destination per SOCKS connection, so the kind check
+        // is explicit rather than relying on the placeholder remote_port = 0.
+        if forward.kind != ForwardKind::Local || forward.remote_port != 22 {
             continue;
         }
         let outcome = setup_second_layer(&session, config, forward, password_senders, app).await?;

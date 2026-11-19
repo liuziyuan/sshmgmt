@@ -7,6 +7,13 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 /// SOCKS protocol version this server speaks.
 const SOCKS_VERSION: u8 = 0x05;
@@ -200,6 +207,153 @@ pub fn russh_error_to_reply(err: &russh::Error) -> Reply {
             tracing::warn!("SOCKS direct-tcpip open failed: {}", other);
             Reply::GeneralFailure
         }
+    }
+}
+
+// ─── Serving dynamic forwards ────────────────────────────────────────────────
+
+/// Time budget for a client to finish the greeting + request handshake.
+/// Port scanners and half-open proxy checks connect and say nothing; without
+/// this they would pin a task (and a socket) per probe indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Accept loop for one `-D` listener. Each client is served on its own task;
+/// a failed `direct-tcpip` open signals `session_error` so the tunnel task
+/// treats it like the `-L` path does (session likely dead → reconnect).
+///
+/// Generic over the russh handler so this module stays decoupled from
+/// tunnel.rs. The listener task is spawned by the caller outside the
+/// establishment race and aborted in its cleanup list.
+pub async fn serve_dynamic<H>(
+    listener: TcpListener,
+    session: Arc<TokioMutex<russh::client::Handle<H>>>,
+    session_error: Arc<Notify>,
+) where
+    H: russh::client::Handler + 'static,
+    H::Error: 'static,
+{
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("SOCKS accept() error: {}", e);
+                break;
+            }
+        };
+        tracing::debug!("SOCKS connection from {}", peer);
+
+        let session = session.clone();
+        let notify = session_error.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(stream, &session, &notify).await {
+                tracing::debug!("SOCKS client {} ended: {}", peer, e);
+            }
+        });
+    }
+}
+
+/// Drive one SOCKS5 client: greeting, request, channel open, then pump bytes.
+async fn handle_client<H>(
+    mut tcp: TcpStream,
+    session: &Arc<TokioMutex<russh::client::Handle<H>>>,
+    session_error: &Notify,
+) -> Result<()>
+where
+    H: russh::client::Handler,
+{
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+
+    // Phase 1: greeting. Only the no-auth method is acceptable.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match parse_greeting(&buf) {
+            Greeting::NeedMore => {}
+            Greeting::NoAcceptableAuth => {
+                tcp.write_all(&method_reply(false)).await?;
+                return Ok(());
+            }
+            Greeting::Ready => break,
+        }
+        let n = read_some(&mut tcp, &mut chunk, deadline).await?;
+        if n == 0 {
+            return Ok(()); // client closed before finishing the greeting
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    tcp.write_all(&method_reply(true)).await?;
+
+    // Drop exactly the greeting bytes; any request bytes that arrived in the
+    // same read (a client that pipelines) stay in the buffer.
+    let greeting_len = 2 + buf[1] as usize;
+    buf.drain(..greeting_len);
+
+    // Phase 2: request. Keep reading until a complete request is buffered.
+    let request = loop {
+        match parse_request(&buf) {
+            Request::NeedMore => {}
+            other => break other,
+        }
+        let n = read_some(&mut tcp, &mut chunk, deadline).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let request = match request {
+        Request::Ok(req) => req,
+        Request::Invalid(reason) => {
+            tracing::debug!("SOCKS request invalid: {}", reason);
+            tcp.write_all(&reply(Reply::GeneralFailure)).await?;
+            return Ok(());
+        }
+        Request::NeedMore => unreachable!("loop exits only on a non-NeedMore result"),
+    };
+
+    if request.command != SocksCommand::Connect {
+        tracing::debug!("SOCKS command {:?} not supported", request.command);
+        tcp.write_all(&reply(Reply::CommandNotSupported)).await?;
+        return Ok(());
+    }
+
+    // Phase 3: open the direct-tcpip channel. Hold the session lock only for
+    // the open call (same granularity as the -L path). The domain is passed
+    // through verbatim so the jump host resolves it.
+    let target = request.host.to_string();
+    let open_result = {
+        let sess = session.lock().await;
+        sess.channel_open_direct_tcpip(&target, request.port as u32, "127.0.0.1", 0)
+            .await
+    };
+
+    match open_result {
+        Ok(channel) => {
+            tcp.write_all(&reply(Reply::Succeeded)).await?;
+            let mut ssh_stream = channel.into_stream();
+            copy_bidirectional(&mut tcp, &mut ssh_stream).await?;
+        }
+        Err(e) => {
+            tracing::warn!("SOCKS channel to {}:{} failed: {}", target, request.port, e);
+            let _ = tcp.write_all(&reply(russh_error_to_reply(&e))).await;
+            // Same signal as the -L path: a session that cannot open channels
+            // is treated as dead and triggers the backoff reconnect.
+            session_error.notify_one();
+        }
+    }
+
+    Ok(())
+}
+
+/// Read into `buf`, bounded by the shared handshake `deadline`.
+async fn read_some(tcp: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<usize> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("SOCKS handshake timeout");
+    }
+    match tokio::time::timeout(remaining, tcp.read(buf)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => anyhow::bail!("SOCKS handshake timeout"),
     }
 }
 
