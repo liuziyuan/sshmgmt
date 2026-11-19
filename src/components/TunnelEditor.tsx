@@ -67,11 +67,20 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
   // Per-render validation for red hints and the save button.
   const formErrors = validateFormState(formState);
 
+  // Token to drop stale parse responses when the user flips tabs quickly:
+  // each switch bumps the counter, responses from older switches are ignored.
+  const switchSeqRef = useRef(0);
+  // Sequence number of the back-fill currently awaiting its parse response;
+  // any form edit nulls it so the response must not overwrite user input.
+  const pendingBackfillRef = useRef<number | null>(null);
+
   function updateForm(patch: Partial<EditorFormState>): void {
+    pendingBackfillRef.current = null; // user edit voids the in-flight back-fill
     setFormState((prev) => ({ ...prev, ...patch }));
   }
 
   function updateForward(i: number, patch: Partial<ForwardRow>): void {
+    pendingBackfillRef.current = null;
     setFormState((prev) => ({
       ...prev,
       forwards: prev.forwards.map((f, idx) => (idx === i ? { ...f, ...patch } : f)),
@@ -79,6 +88,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
   }
 
   function addForward(): void {
+    pendingBackfillRef.current = null;
     setFormState((prev) => ({
       ...prev,
       forwards: [
@@ -89,6 +99,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
   }
 
   function removeForward(i: number): void {
+    pendingBackfillRef.current = null;
     setFormState((prev) => ({
       ...prev,
       forwards: prev.forwards.filter((_, idx) => idx !== i),
@@ -99,10 +110,6 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
     return formErrors.filter((e) => e.field === field);
   }
 
-  // Token to drop stale parse responses when the user flips tabs quickly:
-  // each switch bumps the counter, responses from older switches are ignored.
-  const switchSeqRef = useRef(0);
-
   function handleSwitchTab(tab: "form" | "command"): void {
     if (tab === activeTab) return;
     setActiveTab(tab);
@@ -111,13 +118,22 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
       // Empty command is not a failure: keep the form as-is.
       if (!rawCommand.trim()) return;
       const seq = ++switchSeqRef.current;
+      pendingBackfillRef.current = seq;
       parseCommand(rawCommand)
         .then((cfg) => {
           if (seq !== switchSeqRef.current) return;
+          if (pendingBackfillRef.current !== seq) {
+            // The user edited the form while the parse IPC was in flight:
+            // back-fill is voided and their input is kept (review G2).
+            notify("warn", "命令解析完成，但表单已有手动编辑，未自动回填");
+            return;
+          }
+          pendingBackfillRef.current = null;
           setFormState(configToFormState(cfg));
         })
         .catch((e) => {
           if (seq !== switchSeqRef.current) return;
+          if (pendingBackfillRef.current === seq) pendingBackfillRef.current = null;
           notify("warn", `命令解析失败，表单保持原有内容：${e}`);
         });
     } else {
@@ -309,6 +325,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
             <div style={{ marginTop: 12 }}>
               <button onClick={() => setAdvancedOpen((v) => !v)} style={btnSecondary}>
                 {advancedOpen ? "▾ 高级选项" : "▸ 高级选项"}
+                {fieldErrors("identityFile").length > 0 && "（私钥路径有误）"}
               </button>
               {advancedOpen && (
                 <div style={{ marginTop: 8 }}>

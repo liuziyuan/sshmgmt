@@ -60,10 +60,20 @@ function parsePort(raw: string): number | null {
   return n;
 }
 
-// Validation rules (baseline B3 + ruling on parser-backed bans):
+// Characters that break shell-words tokenization (POSIX quoting and
+// backslash escaping) or the parser's destination/spec splitting. Assembly
+// never escapes them, so any of them would silently corrupt or break the
+// saved command (review S1). Applies to all four free-text fields.
+const FORBIDDEN_QUOTE_BACKSLASH_RE = /['"\\]/;
+
+// Validation rules (baseline B3 + rulings on parser-backed bans):
 // - remote host must not contain ":" (parser splits -L spec on ":");
-// - jump host must not contain "@" (destination splits on last "@");
-// - identity file must not contain double quotes (shell-words quote handling).
+// - jump host must not contain "@" (destination splits on last "@"),
+//   nor "[" or "]" (only bracketed-IPv6 input is normalized away on
+//   change; any remaining bracket is malformed, review G1);
+// - all four free-text fields (jump user/host, remote host, identity
+//   path) must not contain quotes or backslash (review S1 / ruling 3);
+// - identity path double quotes are part of that same ban.
 // Values are trimmed before checks; assembly trims the same way, so the
 // command is built from exactly the validated text.
 export function validateFormState(s: EditorFormState): FormFieldError[] {
@@ -74,6 +84,8 @@ export function validateFormState(s: EditorFormState): FormFieldError[] {
     errors.push({ field: "jumpUser", message: "用户名不能为空" });
   } else if (/\s/.test(jumpUser)) {
     errors.push({ field: "jumpUser", message: "用户名不能包含空格" });
+  } else if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(jumpUser)) {
+    errors.push({ field: "jumpUser", message: "用户名不能包含引号或反斜杠字符" });
   }
 
   const jumpHost = s.jumpHost.trim();
@@ -85,6 +97,12 @@ export function validateFormState(s: EditorFormState): FormFieldError[] {
     }
     if (jumpHost.includes("@")) {
       errors.push({ field: "jumpHost", message: "跳板机地址不能包含 @" });
+    }
+    if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(jumpHost)) {
+      errors.push({ field: "jumpHost", message: "跳板机地址不能包含引号或反斜杠字符" });
+    }
+    if (jumpHost.includes("[") || jumpHost.includes("]")) {
+      errors.push({ field: "jumpHost", message: "跳板机地址不能包含方括号，IPv6 直接填写裸地址即可" });
     }
   }
 
@@ -119,6 +137,11 @@ export function validateFormState(s: EditorFormState): FormFieldError[] {
         field: `forwards[${i}].remoteHost`,
         message: "目标主机暂不支持含冒号的地址（如裸 IPv6）",
       });
+    } else if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(remoteHost)) {
+      errors.push({
+        field: `forwards[${i}].remoteHost`,
+        message: "目标主机不能包含引号或反斜杠字符",
+      });
     }
     if (parsePort(f.remotePort.trim()) === null) {
       errors.push({
@@ -128,8 +151,8 @@ export function validateFormState(s: EditorFormState): FormFieldError[] {
     }
   });
 
-  if (s.identityFile.includes('"')) {
-    errors.push({ field: "identityFile", message: "私钥路径不能包含双引号" });
+  if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(s.identityFile)) {
+    errors.push({ field: "identityFile", message: "私钥路径不能包含引号或反斜杠字符" });
   }
 
   return errors;
@@ -181,11 +204,13 @@ export function formToCommand(s: EditorFormState): FormToCommandResult {
 }
 
 // Back-fill from an existing config (edit mode). Structured fields only,
-// never re-parsing raw_command; ports converted with String().
+// never re-parsing raw_command; ports converted with String(); jump host
+// goes through stripHostBrackets defensively so a legacy bracketed value
+// is stored as the bare address the form expects (review G1).
 export function configToFormState(cfg: TunnelConfig): EditorFormState {
   return {
     jumpUser: cfg.jump_user,
-    jumpHost: cfg.jump_host,
+    jumpHost: stripHostBrackets(cfg.jump_host),
     jumpPort: String(cfg.jump_port),
     forwards: cfg.forwards.map((f) => ({
       localPort: String(f.local_port),
