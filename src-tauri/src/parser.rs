@@ -10,8 +10,9 @@ use crate::model::{ForwardKind, ForwardSpec, Hop, TunnelConfig};
 /// - -L with space or concatenated: `-L port:host:port` or `-Lport:host:port`
 /// - Username containing '@': split on LAST '@' to find host
 /// - Optional -p port, -i identity_file, -g bind-all
-///
-/// Does NOT implement ProxyJump (-J). Input commands use direct single-hop -L.
+/// - -J proxy-jump lists: comma-separated `[user@]host[:port]` items, chained
+///   before the destination (destination's `:port` / `-p` only affect the
+///   last hop).
 pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig> {
     let tokens = shell_words::split(raw)?;
     let tokens: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
@@ -25,6 +26,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
     let tokens = &tokens[start..];
 
     let mut forwards: Vec<ForwardSpec> = Vec::new();
+    let mut jump_hops: Vec<Hop> = Vec::new();
     let mut bind_all = false;
     let mut identity_file: Option<String> = None;
     let mut jump_port: u16 = 22;
@@ -84,6 +86,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
                     'L' => forwards.push(parse_forward_spec(&arg)?),
                     'D' => forwards.push(parse_dynamic_spec(&arg)?),
                     'R' => forwards.push(parse_remote_spec(&arg)?),
+                    'J' => jump_hops.extend(parse_jump_list(&arg)?),
                     'i' => identity_file = Some(arg),
                     'p' => {
                         jump_port = arg
@@ -124,28 +127,39 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
         bail!("No -L/-D/-R port forwarding found in command");
     }
 
+    // Full hop chain: proxy jumps in command order, then the destination.
+    // Jump entries without a user inherit the destination's user (OpenSSH
+    // semantics). `-p` and the destination's `:port` only affect the last hop.
+    let destination_user = jump_user;
+    for hop in &mut jump_hops {
+        if hop.user.is_empty() {
+            hop.user = destination_user.clone();
+        }
+    }
+    jump_hops.push(Hop {
+        user: destination_user,
+        host: jump_host,
+        port: jump_port,
+    });
+    let hops = jump_hops;
+    // The legacy mirror always reflects the first hop (the entry machine).
+    let first = hops.first().expect("hops always contains the destination");
+
     let display_name = name.unwrap_or_else(|| {
         if forwards.len() == 1 {
-            format!("{}:{}", jump_host, forwards[0].local_port)
+            format!("{}:{}", first.host, forwards[0].local_port)
         } else {
-            format!("{} ({} forwards)", jump_host, forwards.len())
+            format!("{} ({} forwards)", first.host, forwards.len())
         }
     });
-
-    // Single-hop config for now; t2 replaces this with the full -J chain.
-    let hops = vec![Hop {
-        user: jump_user.clone(),
-        host: jump_host.clone(),
-        port: jump_port,
-    }];
 
     Ok(TunnelConfig {
         id: Uuid::new_v4().to_string(),
         name: display_name,
         raw_command: raw.to_string(),
-        jump_user,
-        jump_host,
-        jump_port,
+        jump_user: first.user.clone(),
+        jump_host: first.host.clone(),
+        jump_port: first.port,
         hops,
         forwards,
         bind_all,
@@ -247,6 +261,34 @@ fn parse_remote_spec(spec: &str) -> Result<ForwardSpec> {
         .parse()
         .map_err(|_| anyhow!("Invalid target port in -R: {}", target_port_str))?;
     Ok(ForwardSpec::remote(listen_port, host, target_port, bind))
+}
+
+/// Parse a `-J` proxy-jump list: comma-separated `[user@]host[:port]` items.
+/// Userless entries are filled in later from the destination user; a missing
+/// port defaults to 22. `none` and other OpenSSH extensions are not supported.
+fn parse_jump_list(spec: &str) -> Result<Vec<Hop>> {
+    let mut hops = Vec::new();
+    for item in spec.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            bail!("Invalid -J list: empty hop in {:?}", spec);
+        }
+        // Split user@host on the LAST '@' (usernames may contain '@').
+        let (user, hostport) = match item.rfind('@') {
+            Some(pos) => (item[..pos].to_string(), item[pos + 1..].to_string()),
+            None => (String::new(), item.to_string()),
+        };
+        let (host, port) = parse_hostport(&hostport);
+        if host.is_empty() {
+            bail!("Invalid -J list: empty host in {:?}", item);
+        }
+        hops.push(Hop {
+            user,
+            host,
+            port: port.unwrap_or(22),
+        });
+    }
+    Ok(hops)
 }
 
 /// Parse "host" or "host:port". Returns (host, Some(port)) if port is present.
@@ -474,5 +516,118 @@ mod tests {
         assert_eq!(cfg.forwards[2].kind, ForwardKind::Remote);
         assert_eq!(cfg.forwards[2].local_port, 8080);
         assert_eq!(cfg.forwards[2].target(), Some(("localhost", 80)));
+    }
+
+    // ─── -J (proxy jump chains, C4) ──────────────────────────────────────────
+
+    fn hop(user: &str, host: &str, port: u16) -> Hop {
+        Hop {
+            user: user.into(),
+            host: host.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn test_parse_jump_full_form() {
+        let cmd = "ssh -J u1@h1:2222,u2@h2 -L 10008:t:3306 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(
+            cfg.hops,
+            vec![hop("u1", "h1", 2222), hop("u2", "h2", 22), hop("u3", "h3", 22)]
+        );
+        // The legacy mirror always reflects the first (entry) hop.
+        assert_eq!(cfg.jump_user, "u1");
+        assert_eq!(cfg.jump_host, "h1");
+        assert_eq!(cfg.jump_port, 2222);
+    }
+
+    #[test]
+    fn test_parse_jump_concatenated() {
+        let cmd = "ssh -Ju1@h1,u2@h2 -L 10008:t:3306 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.hops.len(), 3);
+        assert_eq!(cfg.hops[0], hop("u1", "h1", 22));
+        assert_eq!(cfg.hops[1], hop("u2", "h2", 22));
+    }
+
+    #[test]
+    fn test_parse_jump_user_inherited() {
+        let cmd = "ssh -J h1,u2@h2 -L 10008:t:3306 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.hops[0], hop("u3", "h1", 22));
+        assert_eq!(cfg.hops[1], hop("u2", "h2", 22));
+        assert_eq!(cfg.hops[2], hop("u3", "h3", 22));
+    }
+
+    #[test]
+    fn test_parse_jump_single_hop() {
+        let cmd = "ssh -J u1@h1 -L 10008:t:3306 u2@h2";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.hops.len(), 2);
+        assert_eq!(cfg.hops[0], hop("u1", "h1", 22));
+        assert_eq!(cfg.hops[1], hop("u2", "h2", 22));
+    }
+
+    #[test]
+    fn test_parse_jump_repeated_appends() {
+        let cmd = "ssh -J u1@h1 -J u2@h2 -L 10008:t:3306 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(
+            cfg.hops,
+            vec![hop("u1", "h1", 22), hop("u2", "h2", 22), hop("u3", "h3", 22)]
+        );
+    }
+
+    #[test]
+    fn test_parse_jump_rejects_empty_item() {
+        assert!(
+            parse_ssh_command("ssh -J u1@h1,,u2@h2 -L 1:t:2 u3@h3", None).is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_jump_rejects_empty_host() {
+        assert!(parse_ssh_command("ssh -J u1@ -L 1:t:2 u3@h3", None).is_err());
+    }
+
+    #[test]
+    fn test_parse_jump_with_dynamic_and_remote() {
+        let cmd = "ssh -J u1@h1 -D 1080 -R 8080:localhost:80 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.hops.len(), 2);
+        assert_eq!(cfg.forwards.len(), 2);
+        assert_eq!(cfg.forwards[0].kind, ForwardKind::Dynamic);
+        assert_eq!(cfg.forwards[1].kind, ForwardKind::Remote);
+    }
+
+    #[test]
+    fn test_parse_no_jump_yields_single_hop() {
+        let cmd = "ssh -L 10008:host:3306 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.hops, vec![hop("user", "jump", 22)]);
+        assert_eq!(cfg.jump_user, "user");
+        assert_eq!(cfg.jump_host, "jump");
+        assert_eq!(cfg.jump_port, 22);
+    }
+
+    #[test]
+    fn test_parse_destination_port_not_applied_to_jump_hops() {
+        let cmd = "ssh -p 2222 -J h1 -L 10008:t:3306 u3@h3";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        // Jump hop: inherited user, default port.
+        assert_eq!(cfg.hops[0], hop("u3", "h1", 22));
+        // -p applies to the destination only.
+        assert_eq!(cfg.hops[1], hop("u3", "h3", 2222));
+        // Legacy mirror = first hop.
+        assert_eq!(cfg.jump_port, 22);
     }
 }
