@@ -1,12 +1,12 @@
 [package]
-name = "sshmgmt"
-version = "1.2.0"
+name = "portunnel"
+version = "2.0.0"
 description = "SSH Tunnel Manager"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "sshmgmt_lib"
+name = "portunnel_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
