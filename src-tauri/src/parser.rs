@@ -82,6 +82,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
 
                 match c {
                     'L' => forwards.push(parse_forward_spec(&arg)?),
+                    'D' => forwards.push(parse_dynamic_spec(&arg)?),
                     'i' => identity_file = Some(arg),
                     'p' => {
                         jump_port = arg
@@ -119,7 +120,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
     }
 
     if forwards.is_empty() {
-        bail!("No -L local port forwarding found in command");
+        bail!("No -L/-D port forwarding found in command");
     }
 
     let display_name = name.unwrap_or_else(|| {
@@ -187,6 +188,27 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
         }
         _ => bail!("Invalid -L spec (expected [bind:]lport:rhost:rport): {}", spec),
     }
+}
+
+/// Parse a `-D` dynamic-forward spec: `[bind:]port` → a Dynamic rule whose
+/// target is decided per-connection at SOCKS handshake time.
+///
+/// Supported forms: `-D 1080`, `-D1080`, `-D localhost:1080`, `-D [::1]:1080`.
+/// If the part after the last ':' parses as a port the prefix is a bind
+/// address and is ignored (mirroring how `-L` discards its bind segment);
+/// otherwise the whole spec must be a bare port.
+fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec> {
+    let port_str = match spec.rfind(':') {
+        Some(pos) => match spec[pos + 1..].parse::<u16>() {
+            Ok(_) => &spec[pos + 1..],
+            Err(_) => spec,
+        },
+        None => spec,
+    };
+    let port = port_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid port in -D: {}", spec))?;
+    Ok(ForwardSpec::dynamic(port))
 }
 
 /// Parse "host" or "host:port". Returns (host, Some(port)) if port is present.
@@ -266,5 +288,69 @@ mod tests {
         assert_eq!(cfg.forwards[0].local_port, 8080);
         assert_eq!(cfg.forwards[0].remote_host, "internal.host");
         assert_eq!(cfg.forwards[0].remote_port, 80);
+    }
+
+    #[test]
+    fn test_parse_dynamic_bare_port() {
+        let cmd = "ssh -D 1080 user@jump.example.com";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.jump_host, "jump.example.com");
+        assert_eq!(cfg.forwards.len(), 1);
+        let f = &cfg.forwards[0];
+        assert_eq!(f.kind, ForwardKind::Dynamic);
+        assert_eq!(f.local_port, 1080);
+        // Placeholder fields for Dynamic rules.
+        assert_eq!(f.remote_host, "");
+        assert_eq!(f.remote_port, 0);
+    }
+
+    #[test]
+    fn test_parse_dynamic_concatenated() {
+        let cmd = "ssh -D1080 user@jump.example.com";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        assert_eq!(cfg.forwards.len(), 1);
+        assert_eq!(cfg.forwards[0].kind, ForwardKind::Dynamic);
+        assert_eq!(cfg.forwards[0].local_port, 1080);
+    }
+
+    #[test]
+    fn test_parse_dynamic_bind_prefix_ignored() {
+        for spec in ["localhost:1080", "[::1]:1080"] {
+            let cmd = format!("ssh -D {} user@jump.example.com", spec);
+            let cfg = parse_ssh_command(&cmd, None).unwrap();
+            assert_eq!(cfg.forwards.len(), 1, "spec: {}", spec);
+            assert_eq!(cfg.forwards[0].kind, ForwardKind::Dynamic, "spec: {}", spec);
+            assert_eq!(cfg.forwards[0].local_port, 1080, "spec: {}", spec);
+        }
+    }
+
+    #[test]
+    fn test_parse_dynamic_invalid_port_rejected() {
+        let cmd = "ssh -D notaport user@jump.example.com";
+        assert!(parse_ssh_command(cmd, None).is_err());
+        // Trailing non-port after ':' also fails (no bare-port fallback shape).
+        let cmd2 = "ssh -D host:notaport user@jump.example.com";
+        assert!(parse_ssh_command(cmd2, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_mixed_local_and_dynamic() {
+        let cmd = "ssh -L 10008:host:3306 -D 1080 user@jump";
+        let cfg = parse_ssh_command(cmd, None).unwrap();
+
+        // Push order follows command order.
+        assert_eq!(cfg.forwards.len(), 2);
+        let l = &cfg.forwards[0];
+        assert_eq!(l.kind, ForwardKind::Local);
+        assert_eq!(l.local_port, 10008);
+        assert_eq!(l.remote_host, "host");
+        assert_eq!(l.remote_port, 3306);
+        let d = &cfg.forwards[1];
+        assert_eq!(d.kind, ForwardKind::Dynamic);
+        assert_eq!(d.local_port, 1080);
+        assert_eq!(d.remote_host, "");
+        assert_eq!(d.remote_port, 0);
     }
 }

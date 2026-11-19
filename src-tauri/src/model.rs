@@ -70,8 +70,6 @@ impl ForwardSpec {
 
     /// Build a Dynamic rule. `remote_host`/`remote_port` are placeholders
     /// (""/0) carrying no meaning for Dynamic forwards.
-    // Called from parser.rs in step 2; tests pin the behavior meanwhile.
-    #[allow(dead_code)]
     pub fn dynamic(local_port: u16) -> Self {
         Self {
             local_port,
