@@ -10,6 +10,10 @@ export const listTunnels = (): Promise<TunnelInfo[]> => invoke("list_tunnels");
 export const parseCommand = (raw: string): Promise<TunnelConfig> =>
   invoke("parse_command", { raw });
 
+/** Legacy data-dir migration warning produced at startup, if any. */
+export const getStartupWarning = (): Promise<string | null> =>
+  invoke("get_startup_warning");
+
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
 export const addTunnel = (
@@ -80,8 +84,8 @@ export const importTunnels = (path: string): Promise<ImportSummary> =>
 /** Native save dialog for the export file; returns null when cancelled. */
 export const pickExportPath = (): Promise<string | null> =>
   save({
-    defaultPath: "tunnels.sshmgmt.json",
-    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+    defaultPath: "tunnels.portunnel.json",
+    filters: [{ name: "SSH 隧道配置", extensions: ["portunnel.json", "sshmgmt.json", "json"] }],
   });
 
 /** Native open dialog for an import file; single selection, null when cancelled. */
@@ -89,7 +93,7 @@ export const pickImportPath = (): Promise<string | null> =>
   open({
     multiple: false,
     directory: false,
-    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+    filters: [{ name: "SSH 隧道配置", extensions: ["portunnel.json", "sshmgmt.json", "json"] }],
   }) as Promise<string | null>;
 
 // ─── Group ordering ──────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import {
   exportTunnels, importTunnels, pickExportPath, pickImportPath,
   getGroupOrder, setGroupOrder as setGroupOrderAPI,
   getCollapsedGroups, setCollapsedGroups as setCollapsedGroupsAPI,
+  getStartupWarning,
 } from "./api";
 import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
@@ -79,6 +80,7 @@ export default function App() {
 
   useEffect(() => {
     reload();
+    getStartupWarning().then((w) => { if (w) notify("warn", w); }).catch(() => {});
 
     const unState = onStateChanged(({ id, state }) => {
       setTunnels((prev) => prev.map((t) => t.config.id === id ? { ...t, state } : t));
