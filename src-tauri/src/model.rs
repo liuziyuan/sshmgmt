@@ -171,9 +171,10 @@ impl ForwardSpec {
     /// Fixed target (host, port). Local: reached through the jump host.
     /// Remote: the local service the server-side listener tunnels back to.
     /// None for Dynamic (target chosen per SOCKS connection) and Unknown.
-    // No production caller in v1.4: the -R dispatcher routes by RemoteRoute
-    // instead. Kept (with its allow) as the semantics are pinned by tests and
-    // it is expected to be needed by v1.5.
+    // Still no production caller after v1.5: the -R dispatcher routes by
+    // RemoteRoute, and hop handling never needs this helper. Only tests call
+    // it (pinning the Local/Remote/Dynamic/Unknown semantics), so the allow
+    // stays.
     #[allow(dead_code)]
     pub fn target(&self) -> Option<(&str, u16)> {
         match &self.kind {

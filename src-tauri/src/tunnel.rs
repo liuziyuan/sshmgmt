@@ -34,8 +34,10 @@ pub(crate) struct ForwardedConn {
 
 pub(crate) struct SshClientHandler {
     disconnect_tx: Option<oneshot::Sender<()>>,
-    /// Present only on the primary jump-host connection when the tunnel has
-    /// Remote rules; receives forwarded-tcpip channels from the read loop.
+    /// Present only on connections of the FINAL hop when the tunnel has
+    /// Remote rules: tcpip_forward is requested on that hop and
+    /// forwarded-tcpip callbacks arrive on that same connection. Intermediate
+    /// hops always carry None.
     forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
 }
 
@@ -1221,18 +1223,6 @@ async fn authenticate_keyboard_interactive(
     Ok(false)
 }
 
-/// Authenticate a session against `host:port` using password / keyboard-
-/// interactive only — public-key attempts, if any, must already have
-/// happened on a *separate* connection (see `connect_and_forward`'s two-phase
-/// jump-host auth) so they can't burn through the server's MaxAuthTries
-/// budget before this ever runs.
-///
-/// - `user`: known username (jump host). `None` means the username is unknown
-///   and must be entered by the user in the prompt (second-layer target host).
-/// - `layer`: "jump" | "target", forwarded to the UI so it can label the prompt.
-///
-/// Tries in order: saved keychain password → prompt the user. On a
-/// successful prompt, optionally uploads the local public key.
 /// Build the `tunnel://password-required` payload. Single-hop (hop=None) has
 /// exactly the v1.4 key set; multi-hop adds 1-based `hopIndex`/`hopTotal` so
 /// the UI can label which hop is asking (C2).
@@ -1258,6 +1248,18 @@ fn password_payload(
     payload
 }
 
+/// Authenticate a session against `host:port` using password / keyboard-
+/// interactive only — public-key attempts, if any, must already have
+/// happened on a *separate* connection (see `connect_and_forward`'s two-phase
+/// jump-host auth) so they can't burn through the server's MaxAuthTries
+/// budget before this ever runs.
+///
+/// - `user`: known username (jump host). `None` means the username is unknown
+///   and must be entered by the user in the prompt (second-layer target host).
+/// - `layer`: "jump" | "target", forwarded to the UI so it can label the prompt.
+///
+/// Tries in order: saved keychain password → prompt the user. On a
+/// successful prompt, optionally uploads the local public key.
 #[allow(clippy::too_many_arguments)]
 async fn password_phase(
     session: &mut russh::client::Handle<SshClientHandler>,
