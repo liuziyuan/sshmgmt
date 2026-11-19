@@ -51,7 +51,8 @@ pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) ->
     }
     if let Err(e) = std::fs::create_dir_all(&new_dir) {
         return Some(format!(
-            "配置目录迁移失败，将以空配置启动（旧数据仍保留）：{e}"
+            "配置目录迁移失败，将以空配置启动（旧数据仍保留在 {}）：{e}",
+            legacy_dir.display()
         ));
     }
     let mut failures = Vec::new();
@@ -69,7 +70,8 @@ pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) ->
         None
     } else {
         Some(format!(
-            "部分配置文件迁移失败，缺少的配置将以空内容启动。旧数据仍完整保留，可手动将旧目录中的对应文件复制到新目录 {}。失败详情：{}",
+            "部分配置文件迁移失败，缺少的配置将以空内容启动。旧数据仍完整保留在 {}，可手动将其中的对应文件复制到新目录 {}。失败详情：{}",
+            legacy_dir.display(),
             new_dir.display(),
             failures.join("；")
         ))
