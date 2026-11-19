@@ -8,7 +8,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
-use crate::model::{ForwardKind, PasswordResponse, TunnelConfig, TunnelState};
+use crate::model::{ForwardKind, Hop, PasswordResponse, TunnelConfig, TunnelState};
 use crate::socks;
 use crate::store;
 
@@ -131,11 +131,13 @@ struct AuthOutcome {
     pubkey_uploaded: Option<bool>,
 }
 
-/// An authenticated jump-host session plus what the forwarding layer needs.
-/// `forward_rx` is Some only when the tunnel has Remote rules.
+/// An authenticated jump chain plus what the forwarding layer needs.
+/// `chain` is ordered entry hop → final hop; all forwarding uses the final
+/// handle. `disconnect_rxs` holds one raw signal per hop. `forward_rx` is Some
+/// only when the tunnel has Remote rules (sender lives on the final hop).
 struct EstablishedSession {
-    handle: russh::client::Handle<SshClientHandler>,
-    disconnect_rx: oneshot::Receiver<()>,
+    chain: Vec<russh::client::Handle<SshClientHandler>>,
+    disconnect_rxs: Vec<oneshot::Receiver<()>>,
     forward_rx: Option<mpsc::UnboundedReceiver<ForwardedConn>>,
 }
 
@@ -267,6 +269,7 @@ async fn cleanup_failed_bind(
     applied: &[(String, u32)],
     bind: &str,
     err: std::io::Error,
+    intermediates: &[russh::client::Handle<SshClientHandler>],
 ) -> ConnectError {
     tasks.abort_all();
     {
@@ -276,7 +279,26 @@ async fn cleanup_failed_bind(
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
+    disconnect_chain_reverse(intermediates).await;
     ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, err))
+}
+
+/// Resolve once when ANY hop's session ends. Each receiver is watched in its
+/// own JoinSet task; the JoinSet is dropped (aborting the watchers) as soon as
+/// the first completes, so this task never leaks watchers. A receiver
+/// resolving with `Err` means its sender was dropped — that hop's handler is
+/// gone, which is equally a session end. The tunnel treats one aggregate
+/// signal exactly like the single disconnect signal of v1.4.
+async fn forward_first_signal(rxs: Vec<oneshot::Receiver<()>>, done: oneshot::Sender<()>) {
+    let mut watchers = tokio::task::JoinSet::new();
+    for rx in rxs {
+        watchers.spawn(async move {
+            let _ = rx.await;
+        });
+    }
+    if watchers.join_next().await.is_some() {
+        let _ = done.send(());
+    }
 }
 
 // ─── Main tunnel loop ─────────────────────────────────────────────────────────
@@ -395,8 +417,8 @@ async fn connect_and_forward(
     // establishment against `control_rx` makes Stop/Reconnect take effect
     // immediately at any point up through "Connected".
     let EstablishedSession {
-        handle: mut session,
-        disconnect_rx,
+        mut chain,
+        disconnect_rxs,
         forward_rx,
     } = tokio::select! {
         res = establish_session(config, password_senders, app) => res?,
@@ -418,9 +440,15 @@ async fn connect_and_forward(
 
     // ── Ask the server for every -R listener before turning green. Green
     // means "the server accepts connections on every requested port"; a
-    // partial success would be a lie. Requests run in rule order. On any
-    // failure, cancel the already-granted listeners, close the session (which
-    // also drops the handler task), then return the classified error.
+    // partial success would be a lie. Requests run in rule order on the FINAL
+    // hop of the chain (the only connection that can receive forwarded-tcpip).
+    // On any failure, cancel the already-granted listeners, tear the chain
+    // down farthest-first (which also drops the handler tasks), then return
+    // the classified error.
+    let final_idx = match chain.len().checked_sub(1) {
+        Some(idx) => idx,
+        None => return Err(ConnectError::Fatal("隧道缺少跳板配置".into())),
+    };
     let mut applied: Vec<(String, u32)> = Vec::new();
     let mut routes: Vec<RemoteRoute> = Vec::new();
     let mut allocated_dynamic: Vec<(String, u16)> = Vec::new();
@@ -435,11 +463,16 @@ async fn connect_and_forward(
             .clone()
             .unwrap_or_else(|| "localhost".to_string());
         let requested = forward.listen_port();
-        let result = tokio::time::timeout(
-            TCPIP_FORWARD_TIMEOUT,
-            session.tcpip_forward(addr.as_str(), requested as u32),
-        )
-        .await;
+        let result = {
+            // The final hop is the forwarding outlet; the mutable borrow is
+            // scoped to the request so the chain stays usable for cleanup.
+            let final_handle = &mut chain[final_idx];
+            tokio::time::timeout(
+                TCPIP_FORWARD_TIMEOUT,
+                final_handle.tcpip_forward(addr.as_str(), requested as u32),
+            )
+            .await
+        };
 
         let failure = match result {
             Ok(Ok(allocated)) => {
@@ -483,10 +516,8 @@ async fn connect_and_forward(
         };
 
         if let Some(err) = failure {
-            cancel_remote_forwards(&session, &applied).await;
-            let _ = session
-                .disconnect(russh::Disconnect::ByApplication, "", "en")
-                .await;
+            cancel_remote_forwards(&chain[final_idx], &applied).await;
+            disconnect_chain_reverse(&chain).await;
             return Err(err);
         }
     }
@@ -507,12 +538,24 @@ async fn connect_and_forward(
         );
     }
 
-    // Wrap session for sharing between listener tasks
-    let session = Arc::new(TokioMutex::new(session));
+    // The final hop is the sole forwarding outlet (-L/-D channels, -R
+    // dispatch, :22 checks all already used it only above). Keep the middle
+    // hops for ordered teardown.
+    let final_handle = chain.pop().expect("establish_session returns a non-empty chain");
+    let intermediates = chain;
+    let session = Arc::new(TokioMutex::new(final_handle));
 
     // session_error_notify: any listener task signals session death here
     let session_error = Arc::new(tokio::sync::Notify::new());
     let mut tasks = TaskSet::new();
+
+    // Any hop's disconnect signal wakes the tunnel exactly once. Spawned
+    // outside the establishment race (invariant 1) and aborted with the rest.
+    let (disconnect_tx, mut disconnect_rx) = oneshot::channel::<()>();
+    tasks.push(tokio::spawn(forward_first_signal(
+        disconnect_rxs,
+        disconnect_tx,
+    )));
 
     for forward in &config.forwards {
         let bind_addr = if config.bind_all { "0.0.0.0" } else { "127.0.0.1" };
@@ -525,7 +568,15 @@ async fn connect_and_forward(
                     Ok(l) => l,
                     Err(e) => {
                         return Err(
-                            cleanup_failed_bind(&mut tasks, &session, &applied, &bind, e).await,
+                            cleanup_failed_bind(
+                                &mut tasks,
+                                &session,
+                                &applied,
+                                &bind,
+                                e,
+                                &intermediates,
+                            )
+                            .await,
                         )
                     }
                 };
@@ -590,7 +641,15 @@ async fn connect_and_forward(
                     Ok(l) => l,
                     Err(e) => {
                         return Err(
-                            cleanup_failed_bind(&mut tasks, &session, &applied, &bind, e).await,
+                            cleanup_failed_bind(
+                                &mut tasks,
+                                &session,
+                                &applied,
+                                &bind,
+                                e,
+                                &intermediates,
+                            )
+                            .await,
                         )
                     }
                 };
@@ -644,39 +703,43 @@ async fn connect_and_forward(
         tasks.push(h);
     }
 
-    // Wait: Stop/Reconnect control | SSH disconnect | listener error
-    let mut drx = disconnect_rx;
+    // Wait: Stop/Reconnect control | any-hop disconnect | listener error
     let result = tokio::select! {
         msg = control_rx.recv() => match msg {
             Some(TunnelControl::Stop) | None => Ok(()),
             Some(TunnelControl::Reconnect) => Err(ConnectError::Retriable(anyhow!("Reconnect requested"))),
         },
-        _ = &mut drx => Err(ConnectError::Retriable(anyhow!("SSH session closed"))),
+        _ = &mut disconnect_rx => Err(ConnectError::Retriable(anyhow!("SSH session closed"))),
         _ = session_error.notified() => Err(ConnectError::Retriable(anyhow!("SSH channel error"))),
     };
 
-    // Cleanup: stop accepting (listeners + dispatch), cancel the server-side
-    // listeners using their actual ports (crucial for -R 0), then disconnect.
-    // Cancelling is best-effort: closing the session revokes them regardless.
+    // Cleanup: stop accepting (listeners + dispatch + signal watcher), cancel
+    // the server-side listeners on the final hop using their actual ports
+    // (crucial for -R 0), disconnect the final hop, then the middle hops
+    // farthest-first. Cancelling is best-effort: closing the session revokes
+    // server-side listeners regardless.
     tasks.abort_all();
     {
         let sess = session.lock().await;
         cancel_remote_forwards(&sess, &applied).await;
         let _ = sess.disconnect(russh::Disconnect::ByApplication, "", "en").await;
     }
+    disconnect_chain_reverse(&intermediates).await;
 
     result
 }
 
-/// Connect and fully authenticate both SSH hops — the jump host (key files,
-/// then password/keyboard-interactive on a fresh connection), and, for any
-/// forward whose target is `:22`, a second-layer login to that target host
-/// through the jump. Returns the authenticated jump-host session, ready for
-/// port forwarding.
+/// Connect and authenticate every hop of the jump chain, then (for `:22`
+/// Local targets) the second-layer login check. Hops are established serially:
+/// the entry hop over direct TCP, each later hop over a fresh direct-tcpip
+/// channel on the previous hop. Every hop keeps its own two-phase auth (keys
+/// on one connection, password/keyboard-interactive on a fresh one) so each
+/// attempt gets an independent MaxAuthTries budget.
 ///
-/// Deliberately does NOT touch `state_map` / emit `Connected` — the caller
-/// (`connect_and_forward`) only does that once this future has actually won
-/// its race against `control_rx` (see there for why that race exists).
+/// Returns the authenticated chain (entry → final) plus one raw disconnect
+/// signal per hop. Deliberately does NOT touch `state_map` / emit `Connected` —
+/// the caller does that only after this future wins its race against
+/// `control_rx` and every -R listener is granted.
 async fn establish_session(
     config: &TunnelConfig,
     password_senders: &PasswordSenders,
@@ -688,9 +751,15 @@ async fn establish_session(
         ..Default::default()
     });
 
-    // Only tunnels with Remote rules need the forwarded-tcpip channel. Both
-    // auth-phase connections carry the same sender; whichever connection ends
-    // up authenticated is the one whose handler can receive pushed channels.
+    let hops = config.resolved_hops();
+    if hops.is_empty() {
+        return Err(ConnectError::Fatal("隧道缺少跳板配置".into()));
+    }
+    let total = hops.len();
+
+    // Only tunnels with Remote rules need the forwarded-tcpip channel, and
+    // only the FINAL hop carries its sender: tcpip_forward is requested there
+    // and forwarded-tcpip arrives on that same connection.
     let (forward_tx, forward_rx) = if config
         .forwards
         .iter()
@@ -702,92 +771,195 @@ async fn establish_session(
         (None, None)
     };
 
-    // Phase 1: connect and try local key files only, on their own connection.
-    // Some servers (esp. AD/Kerberos-integrated jump hosts) set a very low
-    // MaxAuthTries; russh's RSA retry-with-multiple-signature-hashes (see
-    // try_publickey_auth) alone can burn through that budget, and if we then
-    // continued on the SAME connection the password attempt below would never
-    // even get a chance — the server would have already disconnected us.
-    let (mut session, mut disconnect_rx) =
-        connect_jump_host(ssh_config.clone(), config, forward_tx.clone()).await?;
+    let mut chain: Vec<russh::client::Handle<SshClientHandler>> = Vec::new();
+    let mut disconnect_rxs: Vec<oneshot::Receiver<()>> = Vec::new();
 
-    let mut pubkey_authed = false;
-    for key_path in key_paths(config.identity_file.as_deref()) {
-        let p = std::path::Path::new(&key_path);
-        if !p.exists() {
-            continue;
+    for (idx, hop) in hops.iter().enumerate() {
+        let is_final = idx + 1 == total;
+        let hop_forward_tx = if is_final { forward_tx.clone() } else { None };
+        let hop_ctx = if total > 1 {
+            Some((idx + 1, total))
+        } else {
+            None
+        };
+
+        // Phase 1: a fresh connection that only tries local key files. The
+        // entry hop connects directly; later hops open a channel over the
+        // already-authenticated chain.
+        let opened =
+            open_hop_connection(chain.last(), hop, ssh_config.clone(), hop_forward_tx.clone())
+                .await;
+        let (mut session, mut disconnect_rx) = match opened {
+            Ok(v) => v,
+            Err(e) => {
+                disconnect_chain_reverse(&chain).await;
+                return Err(e);
+            }
+        };
+
+        let mut pubkey_authed = false;
+        for key_path in key_paths(config.identity_file.as_deref()) {
+            let p = std::path::Path::new(&key_path);
+            if !p.exists() {
+                continue;
+            }
+            match russh_keys::load_secret_key(p, None) {
+                Ok(kp) => {
+                    match try_publickey_auth(&mut session, &hop.user, kp, &key_path, "jump").await
+                    {
+                        Ok(true) => {
+                            pubkey_authed = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            let _ = session
+                                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                                .await;
+                            disconnect_chain_reverse(&chain).await;
+                            return Err(ConnectError::Retriable(e));
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("Cannot load key {}: {}", key_path, e),
+            }
         }
-        match russh_keys::load_secret_key(p, None) {
-            Ok(kp) => {
-                if try_publickey_auth(&mut session, &config.jump_user, kp, &key_path, "jump")
-                    .await
-                    .map_err(ConnectError::Retriable)?
-                {
-                    pubkey_authed = true;
-                    break;
+
+        let outcome = if pubkey_authed {
+            AuthOutcome {
+                authed: true,
+                pubkey_uploaded: None,
+            }
+        } else {
+            // Phase 2: retire the key-only connection and open a brand-new one
+            // (fresh TCP+SSH for the entry hop, a new channel through the same
+            // previous hops otherwise) so the password attempt gets a clean
+            // MaxAuthTries budget. Whether phase 1 merely refused every key or
+            // was disconnected outright, this mirrors a second ssh invocation.
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            match open_hop_connection(chain.last(), hop, ssh_config.clone(), hop_forward_tx).await
+            {
+                Ok((s2, rx2)) => {
+                    session = s2;
+                    disconnect_rx = rx2;
+                }
+                Err(e) => {
+                    disconnect_chain_reverse(&chain).await;
+                    return Err(e);
                 }
             }
-            Err(e) => tracing::debug!("Cannot load key {}: {}", key_path, e),
+
+            match password_phase(
+                &mut session,
+                Some(hop.user.as_str()),
+                &hop.host,
+                hop.port,
+                "jump",
+                &config.id,
+                password_senders,
+                app,
+                hop_ctx,
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = session
+                        .disconnect(russh::Disconnect::ByApplication, "", "en")
+                        .await;
+                    disconnect_chain_reverse(&chain).await;
+                    return Err(ConnectError::Retriable(e));
+                }
+            }
+        };
+
+        if !outcome.authed {
+            // Wrong credentials on this hop — stop, don't loop the prompt.
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            disconnect_chain_reverse(&chain).await;
+            return Err(ConnectError::Fatal(hop_auth_failure_msg(
+                idx,
+                total,
+                &hop.user,
+                &hop.host,
+            )));
         }
+        match outcome.pubkey_uploaded {
+            Some(true) => {
+                let msg = if total == 1 {
+                    format!("已上传公钥到跳板机 {}，下次免密连接", hop.host)
+                } else {
+                    format!(
+                        "已上传公钥到第 {}/{} 跳 {}，下次免密连接",
+                        idx + 1,
+                        total,
+                        hop.host
+                    )
+                };
+                emit_notice(app, &config.id, "success", &msg);
+            }
+            Some(false) => {
+                let msg = if total == 1 {
+                    format!("公钥上传到跳板机 {} 失败（密码仍可用）", hop.host)
+                } else {
+                    format!(
+                        "公钥上传到第 {}/{} 跳 {} 失败（密码仍可用）",
+                        idx + 1,
+                        total,
+                        hop.host
+                    )
+                };
+                emit_notice(app, &config.id, "warn", &msg);
+            }
+            None => {}
+        }
+
+        chain.push(session);
+        disconnect_rxs.push(disconnect_rx);
     }
 
-    let outcome = if pubkey_authed {
-        AuthOutcome { authed: true, pubkey_uploaded: None }
-    } else {
-        // Phase 2: reconnect with a brand new TCP+SSH handshake before trying
-        // password / keyboard-interactive auth. Whether phase 1 merely
-        // refused every key or was disconnected outright by the server, this
-        // guarantees the password attempt gets a clean MaxAuthTries budget —
-        // exactly like running a second, separate `ssh` invocation would.
-        let (session2, disconnect_rx2) = connect_jump_host(ssh_config, config, forward_tx).await?;
-        session = session2;
-        disconnect_rx = disconnect_rx2;
-
-        password_phase(
-            &mut session,
-            Some(config.jump_user.as_str()),
-            &config.jump_host,
-            config.jump_port,
-            "jump",
-            &config.id,
+    // Second layer: every Local forward whose target is an SSH host (:22)
+    // must authenticate through the final hop — green means both the chain and
+    // the target are truly reachable. A failure here is fatal (red, no
+    // reconnect). This is a connection-time action only; data forwarding still
+    // goes over the final hop's direct-tcpip path.
+    let final_user = hops.last().expect("hops is non-empty").user.clone();
+    for forward in &config.forwards {
+        // Only Local rules have a fixed target to pre-authenticate. Dynamic
+        // rules pick their destination per SOCKS connection, and Remote rules'
+        // target is a local service, so the kind check is explicit.
+        if forward.kind != ForwardKind::Local || forward.remote_port != 22 {
+            continue;
+        }
+        let final_handle = chain.last().expect("chain is non-empty");
+        let outcome = match setup_second_layer(
+            final_handle,
+            config,
+            forward,
+            &final_user,
             password_senders,
             app,
         )
         .await
-        .map_err(ConnectError::Retriable)?
-    };
-
-    if !outcome.authed {
-        // Wrong jump credentials — stop, don't loop the password prompt.
-        return Err(ConnectError::Fatal(format!(
-            "跳板机 {}@{} 认证失败（用户名或密码错误）",
-            config.jump_user, config.jump_host
-        )));
-    }
-    if outcome.pubkey_uploaded == Some(true) {
-        emit_notice(app, &config.id, "success",
-            &format!("已上传公钥到跳板机 {}，下次免密连接", config.jump_host));
-    } else if outcome.pubkey_uploaded == Some(false) {
-        emit_notice(app, &config.id, "warn",
-            &format!("公钥上传到跳板机 {} 失败（密码仍可用）", config.jump_host));
-    }
-
-    // Second layer: every forward whose target is an SSH host (:22) MUST
-    // authenticate — green means both hops are truly established. A failure here
-    // is fatal (red, no reconnect). This is a connection-time action only; data
-    // forwarding below still goes over the single-hop direct-tcpip path.
-    for forward in &config.forwards {
-        // Only Local rules have a fixed target to pre-authenticate. Dynamic
-        // rules pick their destination per SOCKS connection, so the kind check
-        // is explicit rather than relying on the placeholder remote_port = 0.
-        if forward.kind != ForwardKind::Local || forward.remote_port != 22 {
-            continue;
-        }
-        let outcome = setup_second_layer(&session, config, forward, password_senders, app).await?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = final_handle
+                    .disconnect(russh::Disconnect::ByApplication, "", "en")
+                    .await;
+                disconnect_chain_reverse(&chain[..chain.len() - 1]).await;
+                return Err(e);
+            }
+        };
         if !outcome.authed {
-            let _ = session
+            let _ = final_handle
                 .disconnect(russh::Disconnect::ByApplication, "", "en")
                 .await;
+            disconnect_chain_reverse(&chain[..chain.len() - 1]).await;
             return Err(ConnectError::Fatal(format!(
                 "目标主机 {} 认证失败（用户名或密码错误）",
                 forward.remote_host
@@ -803,8 +975,8 @@ async fn establish_session(
     }
 
     Ok(EstablishedSession {
-        handle: session,
-        disconnect_rx,
+        chain,
+        disconnect_rxs,
         forward_rx,
     })
 }
@@ -816,14 +988,14 @@ async fn establish_session(
 /// disconnect manually while stuck, but this avoids relying on that.
 const JUMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Open a fresh TCP+SSH connection to the jump host. Called once for the
-/// key-based auth attempt and, on a separate call, for the password /
+/// Open a fresh TCP+SSH connection to one hop. Called once for the key-based
+/// auth attempt and, on a separate call, for the password /
 /// keyboard-interactive attempt — each connection gets its own MaxAuthTries
 /// budget from the server, mirroring how two independent `ssh` invocations
 /// would behave.
 async fn connect_jump_host(
     ssh_config: Arc<russh::client::Config>,
-    config: &TunnelConfig,
+    hop: &Hop,
     forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
 ) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
     let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
@@ -833,7 +1005,7 @@ async fn connect_jump_host(
     };
     let connect_fut = russh::client::connect(
         ssh_config,
-        (config.jump_host.as_str(), config.jump_port),
+        (hop.host.as_str(), hop.port),
         handler,
     );
     let session = tokio::time::timeout(JUMP_CONNECT_TIMEOUT, connect_fut)
@@ -841,13 +1013,110 @@ async fn connect_jump_host(
         .map_err(|_| {
             ConnectError::Retriable(anyhow!(
                 "连接跳板机 {}:{} 超时（{}s）",
-                config.jump_host,
-                config.jump_port,
+                hop.host,
+                hop.port,
                 JUMP_CONNECT_TIMEOUT.as_secs()
             ))
         })?
         .map_err(|e| ConnectError::Retriable(anyhow!("SSH connect failed: {}", e)))?;
     Ok((session, disconnect_rx))
+}
+
+/// Open one hop's first (key-auth) connection: direct TCP for the entry hop,
+/// a fresh direct-tcpip channel through the already-authenticated prev hop
+/// otherwise.
+async fn open_hop_connection(
+    prev: Option<&russh::client::Handle<SshClientHandler>>,
+    hop: &Hop,
+    ssh_config: Arc<russh::client::Config>,
+    forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
+) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
+    match prev {
+        None => connect_jump_host(ssh_config, hop, forward_tx).await,
+        Some(prev) => open_hop_session(prev, hop, ssh_config, forward_tx).await,
+    }
+}
+
+/// Open a new SSH session to `hop` through the authenticated `prev`
+/// connection: a direct-tcpip channel over `prev`, then a client handshake on
+/// that channel stream. The whole open+handshake is bounded by
+/// `JUMP_CONNECT_TIMEOUT`; keepalive is on (shared Config) so a later death
+/// of this hop is detected by its own connection.
+async fn open_hop_session(
+    prev: &russh::client::Handle<SshClientHandler>,
+    hop: &Hop,
+    ssh_config: Arc<russh::client::Config>,
+    forward_tx: Option<mpsc::UnboundedSender<ForwardedConn>>,
+) -> Result<(russh::client::Handle<SshClientHandler>, oneshot::Receiver<()>), ConnectError> {
+    let (disconnect_tx, disconnect_rx) = oneshot::channel::<()>();
+    let handler = SshClientHandler {
+        disconnect_tx: Some(disconnect_tx),
+        forward_tx,
+    };
+    let host = hop.host.clone();
+    let port = hop.port;
+    let connect_fut = async move {
+        let channel = prev
+            .channel_open_direct_tcpip(&host, port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|e| {
+                ConnectError::Retriable(anyhow!(
+                    "open channel to {}:{} failed: {}",
+                    host,
+                    port,
+                    e
+                ))
+            })?;
+        let stream = channel.into_stream();
+        russh::client::connect_stream(ssh_config, stream, handler)
+            .await
+            .map_err(|e| {
+                ConnectError::Retriable(anyhow!(
+                    "SSH connect through previous hop to {}:{} failed: {}",
+                    host,
+                    port,
+                    e
+                ))
+            })
+    };
+    let session = tokio::time::timeout(JUMP_CONNECT_TIMEOUT, connect_fut)
+        .await
+        .map_err(|_| {
+            ConnectError::Retriable(anyhow!(
+                "连接跳板 {}:{} 超时（{}s）",
+                hop.host,
+                hop.port,
+                JUMP_CONNECT_TIMEOUT.as_secs()
+            ))
+        })??;
+    Ok((session, disconnect_rx))
+}
+
+/// Best-effort disconnect of every hop, farthest first. Closing the far end
+/// before the near end avoids the nearer hops logging misleading
+/// "connection lost" errors for a teardown we initiated.
+async fn disconnect_chain_reverse(chain: &[russh::client::Handle<SshClientHandler>]) {
+    for handle in chain.iter().rev() {
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+    }
+}
+
+/// User-facing auth-failure text for a hop. Single-hop text is byte-identical
+/// to v1.4; multi-hop names the hop that failed (C2).
+fn hop_auth_failure_msg(index: usize, total: usize, user: &str, host: &str) -> String {
+    if total <= 1 {
+        format!("跳板机 {}@{} 认证失败（用户名或密码错误）", user, host)
+    } else {
+        format!(
+            "第 {}/{} 跳 {}@{} 认证失败（用户名或密码错误）",
+            index + 1,
+            total,
+            user,
+            host
+        )
+    }
 }
 
 // ─── Authentication ───────────────────────────────────────────────────────────
@@ -974,6 +1243,7 @@ async fn password_phase(
     id: &str,
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
+    _hop: Option<(usize, usize)>,
 ) -> Result<AuthOutcome> {
     let need_username = user.is_none();
 
@@ -1075,6 +1345,7 @@ async fn setup_second_layer(
     jump: &russh::client::Handle<SshClientHandler>,
     config: &TunnelConfig,
     forward: &crate::model::ForwardSpec,
+    jump_user: &str,
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
 ) -> Result<AuthOutcome, ConnectError> {
@@ -1106,9 +1377,9 @@ async fn setup_second_layer(
     }
 
     // Candidate username for the pubkey attempt: remembered first, else derived
-    // from the jump username by stripping the "@domain" realm.
+    // from the final hop's username by stripping the "@domain" realm.
     let candidate_user = store::get_target_user(host, port).or_else(|| {
-        let ju = config.jump_user.as_str();
+        let ju = jump_user;
         let derived = ju.rsplit_once('@').map(|(u, _)| u).unwrap_or(ju);
         if derived.is_empty() { None } else { Some(derived.to_string()) }
     });
@@ -1158,6 +1429,7 @@ async fn setup_second_layer(
         id,
         password_senders,
         app,
+        None,
     )
     .await
     .map_err(ConnectError::Retriable)?;
@@ -1393,5 +1665,52 @@ mod tests {
         tasks.abort_all();
         tasks.abort_all();
         assert!(wait_for_flag(&flag).await);
+    }
+
+    // ─── hop auth message (C2) ──────────────────────────────────────────────
+
+    #[test]
+    fn hop_auth_failure_msg_single_hop_matches_v14_text() {
+        assert_eq!(
+            hop_auth_failure_msg(0, 1, "u", "h"),
+            "跳板机 u@h 认证失败（用户名或密码错误）"
+        );
+    }
+
+    #[test]
+    fn hop_auth_failure_msg_multi_hop_names_the_hop() {
+        let msg = hop_auth_failure_msg(1, 3, "u2", "h2");
+        assert!(msg.contains("第 2/3 跳"), "msg was: {}", msg);
+        assert!(msg.contains("u2@h2"), "msg was: {}", msg);
+    }
+
+    // ─── disconnect aggregation (C3) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_first_signal_fires_on_any_hop() {
+        let (tx1, rx1) = oneshot::channel::<()>();
+        let (_tx2, rx2) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(forward_first_signal(vec![rx1, rx2], done_tx));
+
+        tx1.send(()).unwrap();
+        let fired = tokio::time::timeout(Duration::from_secs(1), done_rx).await;
+        assert!(matches!(fired, Ok(Ok(()))), "aggregate signal should fire");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_first_signal_fires_on_sender_drop() {
+        let (tx1, rx1) = oneshot::channel::<()>();
+        // Keep the second hop's sender alive so only the dropped one fires.
+        let (_tx2, rx2) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(forward_first_signal(vec![rx1, rx2], done_tx));
+
+        // Dropping one hop's sender means that hop's handler is gone.
+        drop(tx1);
+        let fired = tokio::time::timeout(Duration::from_secs(1), done_rx).await;
+        assert!(matches!(fired, Ok(Ok(()))), "sender drop should fire signal");
+        task.await.unwrap();
     }
 }

@@ -95,8 +95,6 @@ impl TunnelConfig {
     /// The full jump chain (hops + final destination). Falls back to a
     /// synthesized single hop for configs without `hops`. Empty when there is
     /// nothing to connect to (callers treat that as a fatal config error).
-    // Wired into connection setup in t4; tests pin the semantics before that.
-    #[allow(dead_code)]
     pub fn resolved_hops(&self) -> Vec<Hop> {
         if !self.hops.is_empty() {
             self.hops.clone()
