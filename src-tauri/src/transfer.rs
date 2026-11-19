@@ -140,7 +140,7 @@ pub fn split_new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ForwardSpec;
+    use crate::model::{ForwardKind, ForwardSpec};
 
     fn config(id: &str, name: &str) -> TunnelConfig {
         TunnelConfig {
@@ -154,6 +154,7 @@ mod tests {
                 local_port: 5432,
                 remote_host: "db".into(),
                 remote_port: 5432,
+                kind: ForwardKind::Local,
             }],
             bind_all: false,
             identity_file: None,

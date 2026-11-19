@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use uuid::Uuid;
 
-use crate::model::{ForwardSpec, TunnelConfig};
+use crate::model::{ForwardKind, ForwardSpec, TunnelConfig};
 
 /// Parse an ssh command string into a TunnelConfig.
 ///
@@ -166,6 +166,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
                 local_port,
                 remote_host,
                 remote_port,
+                kind: ForwardKind::Local,
             })
         }
         4 => {
@@ -181,6 +182,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
                 local_port,
                 remote_host,
                 remote_port,
+                kind: ForwardKind::Local,
             })
         }
         _ => bail!("Invalid -L spec (expected [bind:]lport:rhost:rport): {}", spec),
