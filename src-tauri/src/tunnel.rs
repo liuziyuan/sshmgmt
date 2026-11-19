@@ -1233,6 +1233,31 @@ async fn authenticate_keyboard_interactive(
 ///
 /// Tries in order: saved keychain password → prompt the user. On a
 /// successful prompt, optionally uploads the local public key.
+/// Build the `tunnel://password-required` payload. Single-hop (hop=None) has
+/// exactly the v1.4 key set; multi-hop adds 1-based `hopIndex`/`hopTotal` so
+/// the UI can label which hop is asking (C2).
+fn password_payload(
+    id: &str,
+    prompt: &str,
+    layer: &str,
+    host: &str,
+    need_username: bool,
+    hop: Option<(usize, usize)>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "id": id,
+        "prompt": prompt,
+        "layer": layer,
+        "host": host,
+        "needUsername": need_username,
+    });
+    if let Some((index, total)) = hop {
+        payload["hopIndex"] = serde_json::json!(index);
+        payload["hopTotal"] = serde_json::json!(total);
+    }
+    payload
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn password_phase(
     session: &mut russh::client::Handle<SshClientHandler>,
@@ -1243,7 +1268,7 @@ async fn password_phase(
     id: &str,
     password_senders: &PasswordSenders,
     app: &tauri::AppHandle,
-    _hop: Option<(usize, usize)>,
+    hop: Option<(usize, usize)>,
 ) -> Result<AuthOutcome> {
     let need_username = user.is_none();
 
@@ -1266,16 +1291,8 @@ async fn password_phase(
         Some(u) => format!("Password for {}@{}", u, host),
         None => format!("Login to target host {}", host),
     };
-    let _ = app.emit(
-        "tunnel://password-required",
-        serde_json::json!({
-            "id": id,
-            "prompt": prompt,
-            "layer": layer,
-            "host": host,
-            "needUsername": need_username,
-        }),
-    );
+    let payload = password_payload(id, &prompt, layer, host, need_username, hop);
+    let _ = app.emit("tunnel://password-required", payload);
 
     match tokio::time::timeout(Duration::from_secs(300), rx).await {
         Ok(Ok(resp)) => {
@@ -1712,5 +1729,31 @@ mod tests {
         let fired = tokio::time::timeout(Duration::from_secs(1), done_rx).await;
         assert!(matches!(fired, Ok(Ok(()))), "sender drop should fire signal");
         task.await.unwrap();
+    }
+
+    // ─── password payload hop context (C2) ──────────────────────────────────
+
+    #[test]
+    fn password_payload_single_hop_has_no_hop_fields() {
+        let v = password_payload("id", "prompt", "jump", "host", false, None);
+
+        assert_eq!(v["id"], "id");
+        assert_eq!(v["prompt"], "prompt");
+        assert_eq!(v["layer"], "jump");
+        assert_eq!(v["host"], "host");
+        assert_eq!(v["needUsername"], false);
+        assert!(v.get("hopIndex").is_none());
+        assert!(v.get("hopTotal").is_none());
+        // Exact key set matches v1.4 (no extra fields).
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn password_payload_multi_hop_carries_index_and_total() {
+        let v = password_payload("id", "prompt", "jump", "h2", false, Some((2, 3)));
+
+        assert_eq!(v["hopIndex"], 2);
+        assert_eq!(v["hopTotal"], 3);
+        assert_eq!(v["host"], "h2");
     }
 }
