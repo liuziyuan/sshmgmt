@@ -6,10 +6,9 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::TunnelConfig;
+use crate::model::{Msg, TunnelConfig};
 use crate::store;
 
 pub const EXPORT_FORMAT: &str = "sshmgmt-tunnels";
@@ -94,40 +93,45 @@ pub fn build_export(tunnels: &[TunnelConfig]) -> ExportFile {
 }
 
 /// Serialize and write the export file (pretty JSON so users can inspect it).
-pub fn write_export(path: &Path, file: &ExportFile) -> Result<()> {
-    let data = serde_json::to_string_pretty(file).context("Failed to serialize export")?;
-    std::fs::write(path, data)
-        .with_context(|| format!("Failed to write export file {:?}", path))?;
+pub fn write_export(path: &Path, file: &ExportFile) -> Result<(), Msg> {
+    let data = serde_json::to_string_pretty(file).map_err(|e| Msg::ExportSerializeFailed {
+        detail: e.to_string(),
+    })?;
+    std::fs::write(path, data).map_err(|e| Msg::ExportWriteFailed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
     Ok(())
 }
 
 /// Read and validate an import file. Rejects unknown formats, versions newer
 /// than what this build understands, and entries with empty id/name.
-pub fn read_import(path: &Path) -> Result<ExportFile> {
-    let data = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read import file {:?}", path))?;
-    let file: ExportFile =
-        serde_json::from_str(&data).context("Import file is not valid JSON")?;
+pub fn read_import(path: &Path) -> Result<ExportFile, Msg> {
+    let data = std::fs::read_to_string(path).map_err(|e| Msg::ImportReadFailed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let file: ExportFile = serde_json::from_str(&data).map_err(|e| Msg::ImportInvalidJson {
+        detail: e.to_string(),
+    })?;
     if file.format != EXPORT_FORMAT {
-        bail!(
-            "Unknown export format {:?} (expected {:?})",
-            file.format,
-            EXPORT_FORMAT
-        );
+        return Err(Msg::ImportUnknownFormat {
+            format: file.format,
+            expected: EXPORT_FORMAT.to_string(),
+        });
     }
     if file.version > EXPORT_VERSION {
-        bail!(
-            "Unsupported export file version {} (this build supports up to {})",
-            file.version,
-            EXPORT_VERSION
-        );
+        return Err(Msg::ImportUnsupportedVersion {
+            version: file.version,
+            max_version: EXPORT_VERSION,
+        });
     }
     for t in &file.tunnels {
         if t.config.id.trim().is_empty() {
-            bail!("Import file contains a tunnel with an empty id");
+            return Err(Msg::ImportEmptyId);
         }
         if t.config.name.trim().is_empty() {
-            bail!("Import file contains a tunnel with an empty name");
+            return Err(Msg::ImportEmptyName);
         }
     }
     Ok(file)

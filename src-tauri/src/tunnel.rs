@@ -8,7 +8,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
-use crate::model::{ForwardKind, Hop, PasswordResponse, TunnelConfig, TunnelState};
+use crate::model::{ForwardKind, Hop, Msg, PasswordResponse, TunnelConfig, TunnelState};
 use crate::socks;
 use crate::store;
 
@@ -106,11 +106,17 @@ pub(crate) fn emit_state(app: &tauri::AppHandle, id: &str, state: &TunnelState) 
     );
 }
 
-/// Emit a transient banner notice to the UI (success / warn / error).
-pub(crate) fn emit_notice(app: &tauri::AppHandle, id: &str, level: &str, message: &str) {
+/// Emit a transient banner notice to the UI (success / warn / error). The
+/// message is a structured `Msg`; the frontend locales translate it in the
+/// user's language at receive time.
+pub(crate) fn emit_notice(app: &tauri::AppHandle, id: &str, level: &str, msg: &Msg) {
     let _ = app.emit(
         "tunnel://notice",
-        serde_json::json!({ "id": id, "level": level, "message": message }),
+        serde_json::json!({
+            "id": id,
+            "level": level,
+            "message": serde_json::to_value(msg).unwrap_or(serde_json::Value::Null),
+        }),
     );
 }
 
@@ -119,11 +125,12 @@ pub(crate) fn emit_notice(app: &tauri::AppHandle, id: &str, level: &str, message
 /// Why a connection attempt ended. Fatal errors (auth failures) stop the tunnel
 /// with a red Failed state and do NOT trigger auto-reconnect; Retriable errors
 /// (network/session drops) go through the normal backoff-reconnect path.
+#[derive(Debug)]
 enum ConnectError {
-    /// Do not reconnect. Carries the user-facing message shown on the red light.
-    Fatal(String),
+    /// Do not reconnect. Carries the structured message shown on the red light.
+    Fatal(Msg),
     /// Reconnect with backoff (if auto_reconnect is on).
-    Retriable(anyhow::Error),
+    Retriable(Msg),
 }
 
 /// Result of authenticating one session. `pubkey_uploaded` is None when no
@@ -206,18 +213,17 @@ impl Drop for TaskSet {
 /// timeouts are network-class → Retriable.
 fn classify_tcpip_forward_err(port: u16, err: TcpipForwardErr) -> ConnectError {
     match err {
-        TcpipForwardErr::TimedOut => ConnectError::Retriable(anyhow!(
-            "申请远端转发监听超时（端口 {}，{}s）",
+        TcpipForwardErr::TimedOut => ConnectError::Retriable(Msg::RemoteForwardTimeout {
             port,
-            TCPIP_FORWARD_TIMEOUT.as_secs()
-        )),
-        TcpipForwardErr::Russh(russh::Error::RequestDenied) => ConnectError::Fatal(format!(
-            "远端端口 {} 被服务器拒绝（可能被占用或未开放转发），已停止",
-            port
-        )),
-        TcpipForwardErr::Russh(e) => {
-            ConnectError::Retriable(anyhow!("申请远端转发端口 {} 失败: {}", port, e))
+            timeout_secs: TCPIP_FORWARD_TIMEOUT.as_secs(),
+        }),
+        TcpipForwardErr::Russh(russh::Error::RequestDenied) => {
+            ConnectError::Fatal(Msg::RemotePortDenied { port })
         }
+        TcpipForwardErr::Russh(e) => ConnectError::Retriable(Msg::RemoteForwardFailed {
+            port,
+            detail: e.to_string(),
+        }),
     }
 }
 
@@ -282,7 +288,10 @@ async fn cleanup_failed_bind(
             .await;
     }
     disconnect_chain_reverse(intermediates).await;
-    ConnectError::Retriable(anyhow!("Cannot bind {}: {}", bind, err))
+    ConnectError::Retriable(Msg::BindFailed {
+        addr: bind.to_string(),
+        detail: err.to_string(),
+    })
 }
 
 /// Resolve once when ANY hop's session ends. Each receiver is watched in its
@@ -338,16 +347,15 @@ pub async fn run_tunnel(
             }
             Err(ConnectError::Fatal(msg)) => {
                 // Auth failure etc. — stop with a red Failed light, no reconnect.
-                tracing::warn!("Tunnel {} fatal: {}", id, msg);
+                tracing::warn!("Tunnel {} fatal: {:?}", id, msg);
                 update_state(&state_map, &id, TunnelState::Failed(msg.clone()));
                 emit_state(&app, &id, &TunnelState::Failed(msg));
                 break;
             }
             Err(ConnectError::Retriable(e)) => {
                 if !config.auto_reconnect {
-                    let msg = e.to_string();
-                    update_state(&state_map, &id, TunnelState::Failed(msg.clone()));
-                    emit_state(&app, &id, &TunnelState::Failed(msg));
+                    update_state(&state_map, &id, TunnelState::Failed(e.clone()));
+                    emit_state(&app, &id, &TunnelState::Failed(e));
                     break;
                 }
 
@@ -359,7 +367,7 @@ pub async fn run_tunnel(
                 }
 
                 tracing::info!(
-                    "Tunnel {} error: {}. Reconnecting in {}s",
+                    "Tunnel {} error: {:?}. Reconnecting in {}s",
                     id, e, backoff_secs
                 );
                 update_state(&state_map, &id, TunnelState::Reconnecting);
@@ -403,9 +411,7 @@ async fn connect_and_forward(
     // app) are preserved in the config but cannot run. If nothing can run at
     // all, fail loudly and stop: a red light is honest, a fake green is not.
     if config.forwards.iter().all(|f| !f.is_supported()) {
-        return Err(ConnectError::Fatal(
-            "该隧道没有可用的转发规则（可能来自更高版本），请升级应用".into(),
-        ));
+        return Err(ConnectError::Fatal(Msg::NoSupportedForwards));
     }
 
     // Establishing the session (TCP connect, jump-host key/password auth, and
@@ -434,7 +440,7 @@ async fn connect_and_forward(
             return match ctrl {
                 Some(TunnelControl::Stop) | None => Ok(()),
                 Some(TunnelControl::Reconnect) => {
-                    Err(ConnectError::Retriable(anyhow!("Reconnect requested")))
+                    Err(ConnectError::Retriable(Msg::ReconnectRequested))
                 }
             };
         }
@@ -449,7 +455,7 @@ async fn connect_and_forward(
     // the classified error.
     let final_idx = match chain.len().checked_sub(1) {
         Some(idx) => idx,
-        None => return Err(ConnectError::Fatal("隧道缺少跳板配置".into())),
+        None => return Err(ConnectError::Fatal(Msg::MissingJumpConfig)),
     };
     let mut applied: Vec<(String, u32)> = Vec::new();
     let mut routes: Vec<RemoteRoute> = Vec::new();
@@ -501,10 +507,9 @@ async fn connect_and_forward(
                     }
                     // Not representable in a u16 — treat as an internal error
                     // but still cancel the grant we just received.
-                    Err(_) => Some(ConnectError::Retriable(anyhow!(
-                        "服务器分配的远端端口超出范围: {}",
-                        actual
-                    ))),
+                    Err(_) => Some(ConnectError::Retriable(Msg::RemotePortOutOfRange {
+                        port: actual,
+                    })),
                 }
             }
             Ok(Err(e)) => Some(classify_tcpip_forward_err(
@@ -536,7 +541,10 @@ async fn connect_and_forward(
             app,
             &config.id,
             "success",
-            &format!("服务器已分配远端端口 {}:{}", shown_addr, port),
+            &Msg::RemotePortAllocated {
+                addr: shown_addr.to_string(),
+                port: *port,
+            },
         );
     }
 
@@ -709,10 +717,10 @@ async fn connect_and_forward(
     let result = tokio::select! {
         msg = control_rx.recv() => match msg {
             Some(TunnelControl::Stop) | None => Ok(()),
-            Some(TunnelControl::Reconnect) => Err(ConnectError::Retriable(anyhow!("Reconnect requested"))),
+            Some(TunnelControl::Reconnect) => Err(ConnectError::Retriable(Msg::ReconnectRequested)),
         },
-        _ = &mut disconnect_rx => Err(ConnectError::Retriable(anyhow!("SSH session closed"))),
-        _ = session_error.notified() => Err(ConnectError::Retriable(anyhow!("SSH channel error"))),
+        _ = &mut disconnect_rx => Err(ConnectError::Retriable(Msg::SshSessionClosed)),
+        _ = session_error.notified() => Err(ConnectError::Retriable(Msg::SshChannelError)),
     };
 
     // Cleanup: stop accepting (listeners + dispatch + signal watcher), cancel
@@ -755,7 +763,7 @@ async fn establish_session(
 
     let hops = config.resolved_hops();
     if hops.is_empty() {
-        return Err(ConnectError::Fatal("隧道缺少跳板配置".into()));
+        return Err(ConnectError::Fatal(Msg::MissingJumpConfig));
     }
     let total = hops.len();
 
@@ -819,7 +827,9 @@ async fn establish_session(
                                 .disconnect(russh::Disconnect::ByApplication, "", "en")
                                 .await;
                             disconnect_chain_reverse(&chain).await;
-                            return Err(ConnectError::Retriable(e));
+                            return Err(ConnectError::Retriable(Msg::JumpKeyAuthError {
+                                detail: e.to_string(),
+                            }));
                         }
                     }
                 }
@@ -872,7 +882,9 @@ async fn establish_session(
                         .disconnect(russh::Disconnect::ByApplication, "", "en")
                         .await;
                     disconnect_chain_reverse(&chain).await;
-                    return Err(ConnectError::Retriable(e));
+                    return Err(ConnectError::Retriable(Msg::JumpPasswordPhaseError {
+                        detail: e.to_string(),
+                    }));
                 }
             }
         };
@@ -893,27 +905,33 @@ async fn establish_session(
         match outcome.pubkey_uploaded {
             Some(true) => {
                 let msg = if total == 1 {
-                    format!("已上传公钥到跳板机 {}，下次免密连接", hop.host)
+                    Msg::PubkeyUploaded {
+                        host: hop.host.clone(),
+                        hop_index: None,
+                        hop_total: None,
+                    }
                 } else {
-                    format!(
-                        "已上传公钥到第 {}/{} 跳 {}，下次免密连接",
-                        idx + 1,
-                        total,
-                        hop.host
-                    )
+                    Msg::PubkeyUploaded {
+                        host: hop.host.clone(),
+                        hop_index: Some(idx + 1),
+                        hop_total: Some(total),
+                    }
                 };
                 emit_notice(app, &config.id, "success", &msg);
             }
             Some(false) => {
                 let msg = if total == 1 {
-                    format!("公钥上传到跳板机 {} 失败（密码仍可用）", hop.host)
+                    Msg::PubkeyUploadFailed {
+                        host: hop.host.clone(),
+                        hop_index: None,
+                        hop_total: None,
+                    }
                 } else {
-                    format!(
-                        "公钥上传到第 {}/{} 跳 {} 失败（密码仍可用）",
-                        idx + 1,
-                        total,
-                        hop.host
-                    )
+                    Msg::PubkeyUploadFailed {
+                        host: hop.host.clone(),
+                        hop_index: Some(idx + 1),
+                        hop_total: Some(total),
+                    }
                 };
                 emit_notice(app, &config.id, "warn", &msg);
             }
@@ -962,17 +980,28 @@ async fn establish_session(
                 .disconnect(russh::Disconnect::ByApplication, "", "en")
                 .await;
             disconnect_chain_reverse(&chain[..chain.len() - 1]).await;
-            return Err(ConnectError::Fatal(format!(
-                "目标主机 {} 认证失败（用户名或密码错误）",
-                forward.remote_host
-            )));
+            return Err(ConnectError::Fatal(Msg::TargetAuthFailed {
+                host: forward.remote_host.clone(),
+            }));
         }
         if outcome.pubkey_uploaded == Some(true) {
-            emit_notice(app, &config.id, "success",
-                &format!("已上传公钥到目标主机 {}，下次免密连接", forward.remote_host));
+            emit_notice(
+                app,
+                &config.id,
+                "success",
+                &Msg::TargetPubkeyUploaded {
+                    host: forward.remote_host.clone(),
+                },
+            );
         } else if outcome.pubkey_uploaded == Some(false) {
-            emit_notice(app, &config.id, "warn",
-                &format!("公钥上传到目标主机 {} 失败（密码仍可用）", forward.remote_host));
+            emit_notice(
+                app,
+                &config.id,
+                "warn",
+                &Msg::TargetPubkeyUploadFailed {
+                    host: forward.remote_host.clone(),
+                },
+            );
         }
     }
 
@@ -1013,14 +1042,17 @@ async fn connect_jump_host(
     let session = tokio::time::timeout(JUMP_CONNECT_TIMEOUT, connect_fut)
         .await
         .map_err(|_| {
-            ConnectError::Retriable(anyhow!(
-                "连接跳板机 {}:{} 超时（{}s）",
-                hop.host,
-                hop.port,
-                JUMP_CONNECT_TIMEOUT.as_secs()
-            ))
+            ConnectError::Retriable(Msg::JumpConnectTimeout {
+                host: hop.host.clone(),
+                port: hop.port,
+                timeout_secs: JUMP_CONNECT_TIMEOUT.as_secs(),
+            })
         })?
-        .map_err(|e| ConnectError::Retriable(anyhow!("SSH connect failed: {}", e)))?;
+        .map_err(|e| {
+            ConnectError::Retriable(Msg::JumpConnectFailed {
+                detail: e.to_string(),
+            })
+        })?;
     Ok((session, disconnect_rx))
 }
 
@@ -1062,34 +1094,31 @@ async fn open_hop_session(
             .channel_open_direct_tcpip(&host, port as u32, "127.0.0.1", 0)
             .await
             .map_err(|e| {
-                ConnectError::Retriable(anyhow!(
-                    "open channel to {}:{} failed: {}",
-                    host,
+                ConnectError::Retriable(Msg::HopChannelOpenFailed {
+                    host: host.clone(),
                     port,
-                    e
-                ))
+                    detail: e.to_string(),
+                })
             })?;
         let stream = channel.into_stream();
         russh::client::connect_stream(ssh_config, stream, handler)
             .await
             .map_err(|e| {
-                ConnectError::Retriable(anyhow!(
-                    "SSH connect through previous hop to {}:{} failed: {}",
-                    host,
+                ConnectError::Retriable(Msg::HopConnectFailed {
+                    host: host.clone(),
                     port,
-                    e
-                ))
+                    detail: e.to_string(),
+                })
             })
     };
     let session = tokio::time::timeout(JUMP_CONNECT_TIMEOUT, connect_fut)
         .await
         .map_err(|_| {
-            ConnectError::Retriable(anyhow!(
-                "连接跳板 {}:{} 超时（{}s）",
-                hop.host,
-                hop.port,
-                JUMP_CONNECT_TIMEOUT.as_secs()
-            ))
+            ConnectError::Retriable(Msg::HopConnectTimeout {
+                host: hop.host.clone(),
+                port: hop.port,
+                timeout_secs: JUMP_CONNECT_TIMEOUT.as_secs(),
+            })
         })??;
     Ok((session, disconnect_rx))
 }
@@ -1105,19 +1134,24 @@ async fn disconnect_chain_reverse(chain: &[russh::client::Handle<SshClientHandle
     }
 }
 
-/// User-facing auth-failure text for a hop. Single-hop text is byte-identical
-/// to v1.4; multi-hop names the hop that failed (C2).
-fn hop_auth_failure_msg(index: usize, total: usize, user: &str, host: &str) -> String {
+/// Structured auth-failure message for a hop. Single-hop carries no hop
+/// fields (byte-stable v1.4 shape); multi-hop names the hop that failed (C2).
+/// The single/multi distinction is rendered by the frontend locales.
+fn hop_auth_failure_msg(index: usize, total: usize, user: &str, host: &str) -> Msg {
     if total <= 1 {
-        format!("跳板机 {}@{} 认证失败（用户名或密码错误）", user, host)
+        Msg::HopAuthFailed {
+            user: user.to_string(),
+            host: host.to_string(),
+            hop_index: None,
+            hop_total: None,
+        }
     } else {
-        format!(
-            "第 {}/{} 跳 {}@{} 认证失败（用户名或密码错误）",
-            index + 1,
-            total,
-            user,
-            host
-        )
+        Msg::HopAuthFailed {
+            user: user.to_string(),
+            host: host.to_string(),
+            hop_index: Some(index + 1),
+            hop_total: Some(total),
+        }
     }
 }
 
@@ -1225,10 +1259,11 @@ async fn authenticate_keyboard_interactive(
 
 /// Build the `tunnel://password-required` payload. Single-hop (hop=None) has
 /// exactly the v1.4 key set; multi-hop adds 1-based `hopIndex`/`hopTotal` so
-/// the UI can label which hop is asking (C2).
+/// the UI can label which hop is asking (C2). `prompt` is a structured `Msg`
+/// rendered by the frontend in the user's language.
 fn password_payload(
     id: &str,
-    prompt: &str,
+    prompt: &Msg,
     layer: &str,
     host: &str,
     need_username: bool,
@@ -1236,7 +1271,7 @@ fn password_payload(
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "id": id,
-        "prompt": prompt,
+        "prompt": serde_json::to_value(prompt).unwrap_or(serde_json::Value::Null),
         "layer": layer,
         "host": host,
         "needUsername": need_username,
@@ -1290,8 +1325,13 @@ async fn password_phase(
         password_senders.lock().unwrap().insert(id.to_string(), tx);
     }
     let prompt = match user {
-        Some(u) => format!("Password for {}@{}", u, host),
-        None => format!("Login to target host {}", host),
+        Some(u) => Msg::PromptJumpPassword {
+            user: u.to_string(),
+            host: host.to_string(),
+        },
+        None => Msg::PromptTargetLogin {
+            host: host.to_string(),
+        },
     };
     let payload = password_payload(id, &prompt, layer, host, need_username, hop);
     let _ = app.emit("tunnel://password-required", payload);
@@ -1382,7 +1422,13 @@ async fn setup_second_layer(
         let channel = jump
             .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
             .await
-            .map_err(|e| ConnectError::Retriable(anyhow!("open channel to {}:{} failed: {}", host, port, e)))?;
+            .map_err(|e| {
+                ConnectError::Retriable(Msg::TargetChannelOpenFailed {
+                    host: host.to_string(),
+                    port,
+                    detail: e.to_string(),
+                })
+            })?;
         let stream = channel.into_stream();
         let ssh_config = Arc::new(russh::client::Config::default());
         let (tx, _rx) = oneshot::channel::<()>();
@@ -1392,7 +1438,11 @@ async fn setup_second_layer(
         };
         russh::client::connect_stream(ssh_config, stream, handler)
             .await
-            .map_err(|e| ConnectError::Retriable(anyhow!("second-layer SSH connect failed: {}", e)))
+            .map_err(|e| {
+                ConnectError::Retriable(Msg::TargetConnectFailed {
+                    detail: e.to_string(),
+                })
+            })
     }
 
     // Candidate username for the pubkey attempt: remembered first, else derived
@@ -1416,7 +1466,11 @@ async fn setup_second_layer(
                 Ok(kp) => {
                     if try_publickey_auth(&mut session, &user, kp, &key_path, "target")
                         .await
-                        .map_err(ConnectError::Retriable)?
+                        .map_err(|e| {
+                            ConnectError::Retriable(Msg::TargetKeyAuthError {
+                                detail: e.to_string(),
+                            })
+                        })?
                     {
                         pubkey_authed = true;
                         break;
@@ -1451,7 +1505,11 @@ async fn setup_second_layer(
         None,
     )
     .await
-    .map_err(ConnectError::Retriable)?;
+    .map_err(|e| {
+        ConnectError::Retriable(Msg::TargetPasswordPhaseError {
+            detail: e.to_string(),
+        })
+    })?;
 
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "en")
@@ -1602,10 +1660,10 @@ mod tests {
     fn request_denied_is_fatal_with_port() {
         match classify_tcpip_forward_err(8080, TcpipForwardErr::Russh(russh::Error::RequestDenied))
         {
-            ConnectError::Fatal(msg) => {
-                assert!(msg.contains("8080"), "message should name the port: {}", msg)
+            ConnectError::Fatal(Msg::RemotePortDenied { port }) => {
+                assert_eq!(port, 8080);
             }
-            ConnectError::Retriable(e) => panic!("expected Fatal, got Retriable: {}", e),
+            other => panic!("expected Fatal(RemotePortDenied), got {:?}", other),
         }
     }
 
@@ -1613,7 +1671,7 @@ mod tests {
     fn disconnect_error_is_retriable() {
         assert!(matches!(
             classify_tcpip_forward_err(8080, TcpipForwardErr::Russh(russh::Error::Disconnect)),
-            ConnectError::Retriable(_)
+            ConnectError::Retriable(Msg::RemoteForwardFailed { .. })
         ));
     }
 
@@ -1621,7 +1679,7 @@ mod tests {
     fn timeout_is_retriable() {
         assert!(matches!(
             classify_tcpip_forward_err(8080, TcpipForwardErr::TimedOut),
-            ConnectError::Retriable(_)
+            ConnectError::Retriable(Msg::RemoteForwardTimeout { port: 8080, .. })
         ));
     }
 
@@ -1689,18 +1747,29 @@ mod tests {
     // ─── hop auth message (C2) ──────────────────────────────────────────────
 
     #[test]
-    fn hop_auth_failure_msg_single_hop_matches_v14_text() {
+    fn hop_auth_failure_msg_single_hop_has_no_hop_fields() {
         assert_eq!(
             hop_auth_failure_msg(0, 1, "u", "h"),
-            "跳板机 u@h 认证失败（用户名或密码错误）"
+            Msg::HopAuthFailed {
+                user: "u".into(),
+                host: "h".into(),
+                hop_index: None,
+                hop_total: None
+            }
         );
     }
 
     #[test]
     fn hop_auth_failure_msg_multi_hop_names_the_hop() {
-        let msg = hop_auth_failure_msg(1, 3, "u2", "h2");
-        assert!(msg.contains("第 2/3 跳"), "msg was: {}", msg);
-        assert!(msg.contains("u2@h2"), "msg was: {}", msg);
+        assert_eq!(
+            hop_auth_failure_msg(1, 3, "u2", "h2"),
+            Msg::HopAuthFailed {
+                user: "u2".into(),
+                host: "h2".into(),
+                hop_index: Some(2),
+                hop_total: Some(3)
+            }
+        );
     }
 
     // ─── disconnect aggregation (C3) ────────────────────────────────────────
@@ -1737,10 +1806,15 @@ mod tests {
 
     #[test]
     fn password_payload_single_hop_has_no_hop_fields() {
-        let v = password_payload("id", "prompt", "jump", "host", false, None);
+        let prompt = Msg::PromptJumpPassword {
+            user: "u".into(),
+            host: "host".into(),
+        };
+        let v = password_payload("id", &prompt, "jump", "host", false, None);
 
         assert_eq!(v["id"], "id");
-        assert_eq!(v["prompt"], "prompt");
+        assert_eq!(v["prompt"]["code"], "promptJumpPassword");
+        assert_eq!(v["prompt"]["params"]["user"], "u");
         assert_eq!(v["layer"], "jump");
         assert_eq!(v["host"], "host");
         assert_eq!(v["needUsername"], false);
@@ -1752,8 +1826,10 @@ mod tests {
 
     #[test]
     fn password_payload_multi_hop_carries_index_and_total() {
-        let v = password_payload("id", "prompt", "jump", "h2", false, Some((2, 3)));
+        let prompt = Msg::PromptTargetLogin { host: "h2".into() };
+        let v = password_payload("id", &prompt, "jump", "h2", false, Some((2, 3)));
 
+        assert_eq!(v["prompt"]["code"], "promptTargetLogin");
         assert_eq!(v["hopIndex"], 2);
         assert_eq!(v["hopTotal"], 3);
         assert_eq!(v["host"], "h2");

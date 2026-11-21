@@ -236,7 +236,7 @@ pub enum TunnelState {
     Connecting,
     Connected,
     Reconnecting,
-    Failed(String),
+    Failed(Msg),
     PasswordRequired,
 }
 
@@ -244,6 +244,146 @@ pub enum TunnelState {
 pub struct TunnelInfo {
     pub config: TunnelConfig,
     pub state: TunnelState,
+}
+
+/// Structured user-facing message: a stable code plus interpolation params.
+/// The backend never renders user-visible text; the frontend locales file
+/// translates `code` (key: `msg.<camelCase variant>`) and interpolates
+/// `params`. Logs keep using Debug output (English).
+/// MUST stay field-identical with `Msg` in src/types.ts (see CLAUDE.md C1).
+///
+/// Serialization is adjacently tagged (same style as `TunnelState`):
+/// `{"code": "bindFailed", "params": {"addr": "...", "detail": "..."}}`.
+/// Optional (`Option`) params are omitted from `params` when `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "code",
+    content = "params",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Msg {
+    // ── Tunnel lifecycle / connection errors (tunnel.rs) ──
+    NoSupportedForwards,
+    MissingJumpConfig,
+    ReconnectRequested,
+    SshSessionClosed,
+    SshChannelError,
+    BindFailed { addr: String, detail: String },
+
+    // ── Remote forward -R (tunnel.rs) ──
+    RemoteForwardTimeout { port: u16, timeout_secs: u64 },
+    RemotePortDenied { port: u16 },
+    RemoteForwardFailed { port: u16, detail: String },
+    RemotePortOutOfRange { port: u32 },
+    RemotePortAllocated { addr: String, port: u16 },
+
+    // ── Connection step errors (tunnel.rs; jump = entry/chain hops,
+    //    target = second-layer login) ──
+    JumpConnectTimeout { host: String, port: u16, timeout_secs: u64 },
+    JumpConnectFailed { detail: String },
+    HopChannelOpenFailed { host: String, port: u16, detail: String },
+    HopConnectFailed { host: String, port: u16, detail: String },
+    HopConnectTimeout { host: String, port: u16, timeout_secs: u64 },
+    TargetChannelOpenFailed { host: String, port: u16, detail: String },
+    TargetConnectFailed { detail: String },
+
+    // ── Auth (tunnel.rs; classification and the two-phase flow are
+    //    unchanged, only the message carrier changes) ──
+    JumpKeyAuthError { detail: String },
+    JumpPasswordPhaseError { detail: String },
+    TargetKeyAuthError { detail: String },
+    TargetPasswordPhaseError { detail: String },
+    /// Single-hop auth failure carries no hop fields; the multi-hop form
+    /// (hop_index/hop_total Some) is rendered from the multi template.
+    HopAuthFailed {
+        user: String,
+        host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_total: Option<usize>,
+    },
+    TargetAuthFailed { host: String },
+
+    // ── Success / warning notices (tunnel.rs emit_notice) ──
+    PubkeyUploaded {
+        host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_total: Option<usize>,
+    },
+    PubkeyUploadFailed {
+        host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hop_total: Option<usize>,
+    },
+    TargetPubkeyUploaded { host: String },
+    TargetPubkeyUploadFailed { host: String },
+
+    // ── Password prompt payloads (tunnel.rs password_payload) ──
+    PromptJumpPassword { user: String, host: String },
+    PromptTargetLogin { host: String },
+
+    // ── Parser errors (parser.rs) ──
+    ParseTokenizeFailed { detail: String },
+    ParseFlagNeedsArg { flag: String },
+    ParseInvalidPort { value: String },
+    ParseNoDestination,
+    ParseNoForwards,
+    ParseInvalidLocalPort { value: String },
+    ParseInvalidRemotePort { value: String },
+    ParseInvalidLSpec { spec: String },
+    ParseInvalidDSpec { spec: String },
+    ParseInvalidRSpec { spec: String },
+    ParseInvalidRListenPort { value: String },
+    ParseREmptyTarget { spec: String },
+    ParseInvalidRTargetPort { value: String },
+    ParseJEmptyHop { spec: String },
+    ParseJEmptyHost { hop: String },
+
+    // ── Command layer (commands.rs) ──
+    TunnelNotFound,
+    NoPendingPassword,
+    ImportKeychainFailed { name: String, detail: String },
+    ImportHopKeychainFailed {
+        name: String,
+        hop_index: usize,
+        hop_total: usize,
+        detail: String,
+    },
+    ImportTargetUserKeychainFailed { name: String, detail: String },
+    /// Fallback wrapper for low-level IO/serialization errors at the command
+    /// boundary; the frontend also maps non-JSON errors onto this code.
+    CommandFailed { detail: String },
+
+    // ── Startup migration warnings (store.rs, pulled via get_startup_warning) ──
+    MigrationFailed { legacy_dir: String, detail: String },
+    MigrationPartialFailed {
+        legacy_dir: String,
+        new_dir: String,
+        /// Joined by the frontend with the language-specific list separator.
+        failures: Vec<String>,
+    },
+
+    // ── Import / export (transfer.rs) ──
+    ExportSerializeFailed { detail: String },
+    ExportWriteFailed { path: String, detail: String },
+    ImportReadFailed { path: String, detail: String },
+    ImportInvalidJson { detail: String },
+    ImportUnknownFormat { format: String, expected: String },
+    ImportUnsupportedVersion { version: u32, max_version: u32 },
+    ImportEmptyId,
+    ImportEmptyName,
+
+    // ── UI support commands (rebuild_tray / set_window_title failure paths) ──
+    TrayMissing,
+    TrayUpdateFailed { detail: String },
+    MainWindowMissing,
+    SetTitleFailed { detail: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,5 +617,61 @@ mod tests {
         assert_eq!(cfg.first_hop(), None);
         assert!(cfg.resolved_hops().is_empty());
         assert!(!cfg.ensure_hops());
+    }
+
+    // ─── Msg serde shape (adjacently tagged, camelCase) ──────────────────────
+
+    #[test]
+    fn msg_unit_variant_serializes_as_code_only() {
+        let json = serde_json::to_string(&Msg::NoSupportedForwards).unwrap();
+        assert_eq!(json, r#"{"code":"noSupportedForwards"}"#);
+        let back: Msg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Msg::NoSupportedForwards);
+    }
+
+    #[test]
+    fn msg_parametrized_variant_carries_camel_case_params() {
+        let msg = Msg::BindFailed {
+            addr: "127.0.0.1:8080".into(),
+            detail: "boom".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"code":"bindFailed","params":{"addr":"127.0.0.1:8080","detail":"boom"}}"#
+        );
+        let back: Msg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// None-valued Option params must be omitted from `params` entirely, so
+    /// the single-hop JSON shape stays byte-stable for the frontend.
+    #[test]
+    fn msg_optional_params_omitted_when_none() {
+        let single = Msg::HopAuthFailed {
+            user: "u".into(),
+            host: "h".into(),
+            hop_index: None,
+            hop_total: None,
+        };
+        let json = serde_json::to_string(&single).unwrap();
+        assert_eq!(
+            json,
+            r#"{"code":"hopAuthFailed","params":{"user":"u","host":"h"}}"#
+        );
+
+        let multi = Msg::HopAuthFailed {
+            user: "u2".into(),
+            host: "h2".into(),
+            hop_index: Some(2),
+            hop_total: Some(3),
+        };
+        let json = serde_json::to_string(&multi).unwrap();
+        assert_eq!(
+            json,
+            r#"{"code":"hopAuthFailed","params":{"user":"u2","host":"h2","hopIndex":2,"hopTotal":3}}"#
+        );
+        let back: Msg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, multi);
     }
 }

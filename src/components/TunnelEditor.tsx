@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { addTunnel, updateTunnel, parseCommand } from "../api";
 import {
   resolveHops,
@@ -7,6 +8,7 @@ import {
   type TunnelInfo,
 } from "../types";
 import type { Notify } from "../App";
+import i18n, { renderMsg, toMessage } from "../i18n";
 import {
   EMPTY_FORM_STATE,
   configToFormState,
@@ -61,6 +63,7 @@ function canEditInForm(cfg: TunnelConfig): boolean {
 }
 
 export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onSaved }: Props) {
+  const { t } = useTranslation();
   const isEdit = editTarget !== null;
   // Editing an unsupported config must land on the command tab regardless
   // of the remembered preference; the form tab is disabled for it below.
@@ -154,7 +157,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
           // as a single-hop -L tunnel. Stay on the command tab instead.
           if (!canEditInForm(cfg)) {
             pendingBackfillRef.current = null;
-            notify("warn", "该命令包含表单无法表达的内容（多跳 / -D / -R），请使用「粘贴命令」编辑");
+            notify("warn", i18n.t("editor.cannotExpress"));
             setActiveTab("command");
             writeStoredTab("command");
             return;
@@ -162,7 +165,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
           if (pendingBackfillRef.current !== seq) {
             // The user edited the form while the parse IPC was in flight:
             // back-fill is voided and their input is kept (review G2).
-            notify("warn", "命令解析完成，但表单已有手动编辑，未自动回填");
+            notify("warn", i18n.t("editor.backfillVoided"));
             return;
           }
           pendingBackfillRef.current = null;
@@ -171,7 +174,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         .catch((e) => {
           if (seq !== switchSeqRef.current) return;
           if (pendingBackfillRef.current === seq) pendingBackfillRef.current = null;
-          notify("warn", `命令解析失败，表单保持原有内容：${e}`);
+          notify("warn", i18n.t("editor.parseFailedKeepForm", { detail: renderMsg(toMessage(e)) }));
         });
     } else {
       const r = formToCommand(formState);
@@ -183,9 +186,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         // no hint needed — the user is about to paste.
         setCommandNote("");
       } else {
-        setCommandNote(
-          "表单还没填完整，暂时无法生成命令；命令框里保留的是原有内容，可以直接继续编辑或重新粘贴。"
-        );
+        setCommandNote(i18n.t("editor.formIncomplete"));
       }
     }
   }
@@ -214,7 +215,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
       setParseError("");
       return;
     }
-    const t = setTimeout(async () => {
+    const timer = setTimeout(async () => {
       try {
         const cfg = await parseCommand(rawCommand);
         setPreview(cfg);
@@ -222,10 +223,10 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         if (!name && !isEdit) setName(cfg.name);
       } catch (e) {
         setPreview(null);
-        setParseError(String(e));
+        setParseError(renderMsg(toMessage(e)));
       }
     }, 400);
-    return () => clearTimeout(t);
+    return () => clearTimeout(timer);
   }, [rawCommand, activeTab]);
 
   // Shared save body; the command source differs per tab (see handleSave).
@@ -252,8 +253,9 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
       onSaved();
       onClose();
     } catch (e) {
-      setSaveError(String(e));
-      notify("error", `保存隧道失败：${e}`);
+      const msg = renderMsg(toMessage(e));
+      setSaveError(msg);
+      notify("error", i18n.t("editor.saveFailed", { detail: msg }));
     } finally {
       setSaving(false);
     }
@@ -281,14 +283,14 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         overflowY: "auto", overflowX: "hidden", overscrollBehavior: "contain",
       }}>
         <h2 style={{ marginTop: 0, marginBottom: 16 }}>
-          {isEdit ? "编辑隧道" : "新增隧道"}
+          {isEdit ? t("editor.editTitle") : t("editor.addTitle")}
         </h2>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
           <button
             onClick={() => handleSwitchTab("form")}
             disabled={formLocked}
-            title={formLocked ? "该隧道包含多跳或非本地转发规则，请使用粘贴命令编辑" : undefined}
+            title={formLocked ? t("editor.tabLockedTitle") : undefined}
             style={
               formLocked
                 ? tabDisabledStyle
@@ -297,52 +299,52 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
                   : tabInactiveStyle
             }
           >
-            表单填写
+            {t("editor.tabForm")}
           </button>
           <button
             onClick={() => handleSwitchTab("command")}
             style={activeTab === "command" ? tabActiveStyle : tabInactiveStyle}
           >
-            粘贴命令
+            {t("editor.tabCommand")}
           </button>
         </div>
 
         {formLocked && (
           <div style={{ color: "#9ca3af", fontSize: 12, marginTop: -8, marginBottom: 12 }}>
-            该隧道包含多跳或非本地（-D / -R）转发规则，表单模式无法完整表达，请使用「粘贴命令」编辑。
+            {t("editor.formLockedNote")}
           </div>
         )}
 
         {activeTab === "form" && (
           <div>
-            <label style={labelStyle}>跳板机用户名</label>
+            <label style={labelStyle}>{t("editor.jumpUserLabel")}</label>
             <input
               value={formState.jumpUser}
               onChange={(e) => updateForm({ jumpUser: e.target.value })}
-              placeholder="登录跳板机的用户名"
+              placeholder={t("editor.jumpUserPlaceholder")}
               style={inputStyle}
             />
-            <ErrorHints errors={fieldErrors("jumpUser")} />
+            <ErrorHints errors={fieldErrors("jumpUser")} t={t} />
 
-            <label style={{ ...labelStyle, marginTop: 12 }}>跳板机地址</label>
+            <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.jumpHostLabel")}</label>
             <input
               value={formState.jumpHost}
               onChange={(e) => updateForm({ jumpHost: stripHostBrackets(e.target.value) })}
-              placeholder="支持 IP、域名；IPv6 直接填写（如 ::1），无需方括号"
+              placeholder={t("editor.jumpHostPlaceholder")}
               style={inputStyle}
             />
-            <ErrorHints errors={fieldErrors("jumpHost")} />
+            <ErrorHints errors={fieldErrors("jumpHost")} t={t} />
 
-            <label style={{ ...labelStyle, marginTop: 12 }}>跳板机端口</label>
+            <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.jumpPortLabel")}</label>
             <input
               value={formState.jumpPort}
               onChange={(e) => updateForm({ jumpPort: e.target.value })}
               placeholder="22"
               style={inputStyle}
             />
-            <ErrorHints errors={fieldErrors("jumpPort")} />
+            <ErrorHints errors={fieldErrors("jumpPort")} t={t} />
 
-            <label style={{ ...labelStyle, marginTop: 12 }}>转发规则（至少一条）</label>
+            <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.forwardsLabel")}</label>
             {formState.forwards.map((f, i) => (
               <div key={i} style={{ marginBottom: 8 }}>
                 <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
@@ -350,45 +352,45 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
                     <input
                       value={f.localPort}
                       onChange={(e) => updateForward(i, { localPort: e.target.value })}
-                      placeholder="本地端口"
+                      placeholder={t("editor.localPortPlaceholder")}
                       style={inputStyle}
                     />
-                    <ErrorHints errors={fieldErrors(`forwards[${i}].localPort`)} />
+                    <ErrorHints errors={fieldErrors(`forwards[${i}].localPort`)} t={t} />
                   </div>
                   <div style={{ flex: 1 }}>
                     <input
                       value={f.remoteHost}
                       onChange={(e) => updateForward(i, { remoteHost: e.target.value })}
-                      placeholder="目标主机"
+                      placeholder={t("editor.remoteHostPlaceholder")}
                       style={inputStyle}
                     />
-                    <ErrorHints errors={fieldErrors(`forwards[${i}].remoteHost`)} />
+                    <ErrorHints errors={fieldErrors(`forwards[${i}].remoteHost`)} t={t} />
                   </div>
                   <div style={{ width: 130 }}>
                     <input
                       value={f.remotePort}
                       onChange={(e) => updateForward(i, { remotePort: e.target.value })}
-                      placeholder="目标端口"
+                      placeholder={t("editor.remotePortPlaceholder")}
                       style={inputStyle}
                     />
-                    <ErrorHints errors={fieldErrors(`forwards[${i}].remotePort`)} />
+                    <ErrorHints errors={fieldErrors(`forwards[${i}].remotePort`)} t={t} />
                   </div>
-                  <button onClick={() => removeForward(i)} style={btnSecondary}>删除</button>
+                  <button onClick={() => removeForward(i)} style={btnSecondary}>{t("common.delete")}</button>
                 </div>
               </div>
             ))}
-            <ErrorHints errors={fieldErrors("forwards")} />
+            <ErrorHints errors={fieldErrors("forwards")} t={t} />
             <div style={{ marginTop: 8 }}>
-              <button onClick={addForward} style={btnSecondary}>+ 添加转发规则</button>
+              <button onClick={addForward} style={btnSecondary}>{t("editor.addForward")}</button>
             </div>
             <div style={{ color: "#6b7280", fontSize: 12, marginTop: 8 }}>
-              目标主机是从跳板机看过去的地址（如内网 IP 或内网域名）
+              {t("editor.forwardsHint")}
             </div>
 
             <div style={{ marginTop: 12 }}>
               <button onClick={() => setAdvancedOpen((v) => !v)} style={btnSecondary}>
-                {advancedOpen ? "▾ 高级选项" : "▸ 高级选项"}
-                {fieldErrors("identityFile").length > 0 && "（私钥路径有误）"}
+                {advancedOpen ? "▾ " : "▸ "}{t("editor.advanced")}
+                {fieldErrors("identityFile").length > 0 && t("editor.advancedErrorSuffix")}
               </button>
               {advancedOpen && (
                 <div style={{ marginTop: 8 }}>
@@ -401,16 +403,16 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
                       checked={formState.bindAll}
                       onChange={(e) => updateForm({ bindAll: e.target.checked })}
                     />
-                    监听所有网卡 (-g)
+                    {t("editor.bindAllLabel")}
                   </label>
-                  <label style={labelStyle}>私钥文件路径（选填）</label>
+                  <label style={labelStyle}>{t("editor.identityLabel")}</label>
                   <input
                     value={formState.identityFile}
                     onChange={(e) => updateForm({ identityFile: e.target.value })}
-                    placeholder="例如 ~/.ssh/id_ed25519，留空则不使用"
+                    placeholder={t("editor.identityPlaceholder")}
                     style={inputStyle}
                   />
-                  <ErrorHints errors={fieldErrors("identityFile")} />
+                  <ErrorHints errors={fieldErrors("identityFile")} t={t} />
                 </div>
               )}
             </div>
@@ -419,11 +421,11 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
 
         {activeTab === "command" && (
           <>
-            <label style={labelStyle}>ssh 命令</label>
+            <label style={labelStyle}>{t("editor.commandLabel")}</label>
             <textarea
               value={rawCommand}
               onChange={(e) => { setRawCommand(e.target.value); setCommandNote(""); }}
-              placeholder="粘贴 ssh 命令，例如：ssh -fNg -L 10008:host:3306 user@jump"
+              placeholder={t("editor.commandPlaceholder")}
               style={{
                 width: "100%", height: 80, fontFamily: "monospace", fontSize: 13,
                 backgroundColor: "#1f2937", color: "#f9fafb", border: "1px solid #374151",
@@ -445,32 +447,32 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
           </>
         )}
 
-        <label style={{ ...labelStyle, marginTop: 12 }}>显示名称（选填）</label>
+        <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.nameLabel")}</label>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="留空则自动生成"
+          placeholder={t("editor.namePlaceholder")}
           style={inputStyle}
         />
 
-        <label style={{ ...labelStyle, marginTop: 12 }}>项目 / 分组（选填）</label>
+        <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.groupLabel")}</label>
         <input
           list="group-options"
           value={group}
           onChange={(e) => { setGroup(e.target.value); setEnvironment(""); }}
-          placeholder="选择或输入新组名"
+          placeholder={t("editor.groupPlaceholder")}
           style={inputStyle}
         />
         <datalist id="group-options">
           {groupOptions.map((g) => <option key={g} value={g} />)}
         </datalist>
 
-        <label style={{ ...labelStyle, marginTop: 12 }}>环境（选填）</label>
+        <label style={{ ...labelStyle, marginTop: 12 }}>{t("editor.envLabel")}</label>
         <input
           list="env-options"
           value={environment}
           onChange={(e) => setEnvironment(e.target.value)}
-          placeholder="选择已有环境，或输入新环境（保存时统一大写）"
+          placeholder={t("editor.envPlaceholder")}
           style={inputStyle}
         />
         <datalist id="env-options">
@@ -482,7 +484,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
-          <button onClick={onClose} style={btnSecondary}>取消</button>
+          <button onClick={onClose} style={btnSecondary}>{t("common.cancel")}</button>
           <button
             onClick={handleSave}
             disabled={
@@ -493,7 +495,7 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
             }
             style={btnPrimary}
           >
-            {saving ? "保存中…" : "保存"}
+            {saving ? t("common.saving") : t("common.save")}
           </button>
         </div>
       </div>
@@ -506,29 +508,37 @@ export default function TunnelEditor({ editTarget, tunnels, notify, onClose, onS
 // always render identically. Kind-aware rows keep -D/-R/unknown distinct;
 // multi-hop chains get one row per hop, single hop keeps the legacy line.
 function PreviewPanel({ config }: { config: TunnelConfig }) {
+  const { t } = useTranslation();
   const hops = resolveHops(config);
   return (
     <div style={{
       backgroundColor: "#111827", border: "1px solid #374151",
       borderRadius: 6, padding: 12, marginTop: 8, fontSize: 12,
     }}>
-      <div style={{ color: "#9ca3af", marginBottom: 6 }}>解析结果预览</div>
+      <div style={{ color: "#9ca3af", marginBottom: 6 }}>{t("preview.title")}</div>
       {hops.length > 1 ? (
         hops.map((h, i) => (
           <Row
             key={i}
-            label={`第 ${i + 1} 跳`}
+            label={t("preview.hop", { index: i + 1 })}
             value={`${h.user}@${h.host}:${h.port}`}
           />
         ))
       ) : (
-        <Row label="跳板机" value={`${config.jump_user}@${config.jump_host}:${config.jump_port}`} />
+        <Row
+          label={t("preview.jump")}
+          value={`${config.jump_user}@${config.jump_host}:${config.jump_port}`}
+        />
       )}
       {config.forwards.map((f, i) => (
-        <Row key={i} label={`转发 ${i + 1}`} value={describeForward(f)} />
+        <Row
+          key={i}
+          label={t("preview.forward", { index: i + 1 })}
+          value={describeForward(f, t)}
+        />
       ))}
       {config.bind_all && (
-        <Row label="-g" value="监听所有网卡 (0.0.0.0)" />
+        <Row label="-g" value={t("preview.bindAll")} />
       )}
     </div>
   );
@@ -536,16 +546,29 @@ function PreviewPanel({ config }: { config: TunnelConfig }) {
 
 // One-line description of a forward rule by kind. Unknown kinds come from
 // a newer backend and are surfaced as unsupported instead of guessed.
-function describeForward(f: ForwardSpec): string {
+// Takes the render-path `t` so a language switch re-renders the preview.
+function describeForward(
+  f: ForwardSpec,
+  t: (key: string, params?: Record<string, unknown>) => string,
+): string {
   switch (f.kind) {
     case "dynamic":
-      return `本地 :${f.local_port} → SOCKS 代理（跳板侧解析域名）`;
+      return t("forwardDesc.dynamic", { localPort: f.local_port });
     case "remote":
-      return `服务器 ${f.remote_bind ? `${f.remote_bind}:` : ""}:${f.local_port} → 本地 ${f.remote_host}:${f.remote_port}`;
+      return t("forwardDesc.remote", {
+        bind: f.remote_bind ? `${f.remote_bind}:` : "",
+        listenPort: f.local_port,
+        targetHost: f.remote_host,
+        targetPort: f.remote_port,
+      });
     case "local":
-      return `本地 :${f.local_port} → ${f.remote_host}:${f.remote_port}`;
+      return t("forwardDesc.local", {
+        localPort: f.local_port,
+        targetHost: f.remote_host,
+        targetPort: f.remote_port,
+      });
     default:
-      return "未知转发类型（当前版本不支持）";
+      return t("forwardDesc.unknown");
   }
 }
 
@@ -558,14 +581,21 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-// Per-field red hint lines under form inputs.
-function ErrorHints({ errors }: { errors: FormFieldError[] }) {
+// Per-field red hint lines under form inputs; codes are translated at
+// render time so a language switch refreshes open editors.
+function ErrorHints({
+  errors,
+  t,
+}: {
+  errors: FormFieldError[];
+  t: (key: string, params?: Record<string, unknown>) => string;
+}) {
   if (errors.length === 0) return null;
   return (
     <>
       {errors.map((e, i) => (
         <div key={i} style={{ color: "#f87171", fontSize: 12, marginTop: 4 }}>
-          {e.message}
+          {t(e.code, e.params)}
         </div>
       ))}
     </>

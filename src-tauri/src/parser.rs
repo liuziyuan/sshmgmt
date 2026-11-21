@@ -1,7 +1,6 @@
-use anyhow::{anyhow, bail, Result};
 use uuid::Uuid;
 
-use crate::model::{ForwardKind, ForwardSpec, Hop, TunnelConfig};
+use crate::model::{ForwardKind, ForwardSpec, Hop, Msg, TunnelConfig};
 
 /// Parse an ssh command string into a TunnelConfig.
 ///
@@ -13,8 +12,13 @@ use crate::model::{ForwardKind, ForwardSpec, Hop, TunnelConfig};
 /// - -J proxy-jump lists: comma-separated `[user@]host[:port]` items, chained
 ///   before the destination (destination's `:port` / `-p` only affect the
 ///   last hop).
-pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig> {
-    let tokens = shell_words::split(raw)?;
+///
+/// Errors are structured `Msg` codes; the frontend locales render them in
+/// the user's language.
+pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig, Msg> {
+    let tokens = shell_words::split(raw).map_err(|e| Msg::ParseTokenizeFailed {
+        detail: e.to_string(),
+    })?;
     let tokens: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
 
     // Skip leading "ssh" token if present
@@ -77,7 +81,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
                     // arg is next token
                     i += 1;
                     if i >= tokens.len() {
-                        bail!("Flag -{} requires an argument", c);
+                        return Err(Msg::ParseFlagNeedsArg { flag: c.to_string() });
                     }
                     tokens[i].to_string()
                 };
@@ -89,9 +93,9 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
                     'J' => jump_hops.extend(parse_jump_list(&arg)?),
                     'i' => identity_file = Some(arg),
                     'p' => {
-                        jump_port = arg
-                            .parse()
-                            .map_err(|_| anyhow!("Invalid port: {}", arg))?
+                        jump_port = arg.parse().map_err(|_| Msg::ParseInvalidPort {
+                            value: arg.clone(),
+                        })?
                     }
                     _ => {} // ignore other arg-taking flags
                 }
@@ -110,7 +114,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
         i += 1;
     }
 
-    let dest = destination.ok_or_else(|| anyhow!("No SSH destination found in command"))?;
+    let dest = destination.ok_or(Msg::ParseNoDestination)?;
 
     // Split user@host on LAST '@' — handles usernames like "liu.zy@pg.com"
     let (jump_user, hostport) = match dest.rfind('@') {
@@ -124,7 +128,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
     }
 
     if forwards.is_empty() {
-        bail!("No -L/-D/-R port forwarding found in command");
+        return Err(Msg::ParseNoForwards);
     }
 
     // Full hop chain: proxy jumps in command order, then the destination.
@@ -171,7 +175,7 @@ pub fn parse_ssh_command(raw: &str, name: Option<String>) -> Result<TunnelConfig
 }
 
 /// Parse `[bind:]local_port:remote_host:remote_port`
-fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
+fn parse_forward_spec(spec: &str) -> Result<ForwardSpec, Msg> {
     // Split into at most 4 parts. Handles:
     //   3 parts: local_port:remote_host:remote_port
     //   4 parts: bind_addr:local_port:remote_host:remote_port
@@ -181,11 +185,11 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
         3 => {
             let local_port = parts[0]
                 .parse()
-                .map_err(|_| anyhow!("Invalid local port in -L: {}", parts[0]))?;
+                .map_err(|_| Msg::ParseInvalidLocalPort { value: parts[0].into() })?;
             let remote_host = parts[1].to_string();
             let remote_port = parts[2]
                 .parse()
-                .map_err(|_| anyhow!("Invalid remote port in -L: {}", parts[2]))?;
+                .map_err(|_| Msg::ParseInvalidRemotePort { value: parts[2].into() })?;
             Ok(ForwardSpec {
                 local_port,
                 remote_host,
@@ -198,11 +202,11 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
             // 4 parts: bind_addr:local_port:remote_host:remote_port
             let local_port = parts[1]
                 .parse()
-                .map_err(|_| anyhow!("Invalid local port in -L: {}", parts[1]))?;
+                .map_err(|_| Msg::ParseInvalidLocalPort { value: parts[1].into() })?;
             let remote_host = parts[2].to_string();
             let remote_port = parts[3]
                 .parse()
-                .map_err(|_| anyhow!("Invalid remote port in -L: {}", parts[3]))?;
+                .map_err(|_| Msg::ParseInvalidRemotePort { value: parts[3].into() })?;
             Ok(ForwardSpec {
                 local_port,
                 remote_host,
@@ -211,7 +215,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
                 remote_bind: None,
             })
         }
-        _ => bail!("Invalid -L spec (expected [bind:]lport:rhost:rport): {}", spec),
+        _ => Err(Msg::ParseInvalidLSpec { spec: spec.into() }),
     }
 }
 
@@ -222,7 +226,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
 /// If the part after the last ':' parses as a port the prefix is a bind
 /// address and is ignored (mirroring how `-L` discards its bind segment);
 /// otherwise the whole spec must be a bare port.
-fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec> {
+fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec, Msg> {
     let port_str = match spec.rfind(':') {
         Some(pos) => match spec[pos + 1..].parse::<u16>() {
             Ok(_) => &spec[pos + 1..],
@@ -232,7 +236,7 @@ fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec> {
     };
     let port = port_str
         .parse()
-        .map_err(|_| anyhow!("Invalid port in -D: {}", spec))?;
+        .map_err(|_| Msg::ParseInvalidDSpec { spec: spec.into() })?;
     Ok(ForwardSpec::dynamic(port))
 }
 
@@ -244,34 +248,34 @@ fn parse_dynamic_spec(spec: &str) -> Result<ForwardSpec> {
 /// A listen port of 0 is valid (the server picks one at connect time). The
 /// bind segment is kept as-is (`None` when absent, `Some("")` for a leading
 /// colon) — the caller maps `None` to the safe "localhost" default.
-fn parse_remote_spec(spec: &str) -> Result<ForwardSpec> {
+fn parse_remote_spec(spec: &str) -> Result<ForwardSpec, Msg> {
     let parts: Vec<&str> = spec.splitn(4, ':').collect();
     let (bind, listen_port_str, host, target_port_str) = match parts.len() {
         3 => (None, parts[0], parts[1], parts[2]),
         4 => (Some(parts[0].to_string()), parts[1], parts[2], parts[3]),
-        _ => bail!("Invalid -R spec (expected [bind:]port:host:port): {}", spec),
+        _ => return Err(Msg::ParseInvalidRSpec { spec: spec.into() }),
     };
     let listen_port = listen_port_str
         .parse()
-        .map_err(|_| anyhow!("Invalid remote listen port in -R: {}", listen_port_str))?;
+        .map_err(|_| Msg::ParseInvalidRListenPort { value: listen_port_str.into() })?;
     if host.is_empty() {
-        bail!("Invalid -R spec: empty target host: {}", spec);
+        return Err(Msg::ParseREmptyTarget { spec: spec.into() });
     }
     let target_port = target_port_str
         .parse()
-        .map_err(|_| anyhow!("Invalid target port in -R: {}", target_port_str))?;
+        .map_err(|_| Msg::ParseInvalidRTargetPort { value: target_port_str.into() })?;
     Ok(ForwardSpec::remote(listen_port, host, target_port, bind))
 }
 
 /// Parse a `-J` proxy-jump list: comma-separated `[user@]host[:port]` items.
 /// Userless entries are filled in later from the destination user; a missing
 /// port defaults to 22. `none` and other OpenSSH extensions are not supported.
-fn parse_jump_list(spec: &str) -> Result<Vec<Hop>> {
+fn parse_jump_list(spec: &str) -> Result<Vec<Hop>, Msg> {
     let mut hops = Vec::new();
     for item in spec.split(',') {
         let item = item.trim();
         if item.is_empty() {
-            bail!("Invalid -J list: empty hop in {:?}", spec);
+            return Err(Msg::ParseJEmptyHop { spec: spec.into() });
         }
         // Split user@host on the LAST '@' (usernames may contain '@').
         let (user, hostport) = match item.rfind('@') {
@@ -280,7 +284,7 @@ fn parse_jump_list(spec: &str) -> Result<Vec<Hop>> {
         };
         let (host, port) = parse_hostport(&hostport);
         if host.is_empty() {
-            bail!("Invalid -J list: empty host in {:?}", item);
+            return Err(Msg::ParseJEmptyHost { hop: item.into() });
         }
         hops.push(Hop {
             user,
