@@ -236,7 +236,7 @@ pub enum TunnelState {
     Connecting,
     Connected,
     Reconnecting,
-    Failed(String),
+    Failed(Msg),
     PasswordRequired,
 }
 
