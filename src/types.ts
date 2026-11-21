@@ -50,6 +50,17 @@ export function resolveHops(config: TunnelConfig): Hop[] {
   return [];
 }
 
+/**
+ * A structured backend message: stable code plus interpolation params.
+ * Field-identical with the Rust `Msg` enum in src-tauri/src/model.rs (C1).
+ * Narrowed to the full discriminated union of codes in S6; the loose string
+ * form keeps the S1 i18n skeleton compiling standalone.
+ */
+export interface LocalizedMessage {
+  code: string;
+  params?: Record<string, unknown>;
+}
+
 export type TunnelState =
   | { type: "Disconnected" }
   | { type: "Connecting" }
