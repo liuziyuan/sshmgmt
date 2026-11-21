@@ -11,10 +11,11 @@ import {
 } from "./api";
 import type { PasswordRequiredPayload, NoticePayload } from "./api";
 import type { TunnelInfo } from "./types";
-import i18n, { renderMsg, toMessage } from "./i18n";
+import i18n, { applyLanguage, renderMsg, savedLanguageChoice, toMessage } from "./i18n";
 import TunnelList from "./components/TunnelList";
 import TunnelEditor from "./components/TunnelEditor";
 import PasswordModal from "./components/PasswordModal";
+import SettingsModal from "./components/SettingsModal";
 
 // ─── Banner (toast) feedback ───────────────────────────────────────────────────
 // error / warn banners are persistent — the user must click ✕ to dismiss them.
@@ -36,6 +37,7 @@ export default function App() {
   const [showEditor, setShowEditor] = useState(false);
   const [editTarget, setEditTarget] = useState<TunnelInfo | null>(null);
   const [pendingPassword, setPendingPassword] = useState<PasswordRequiredPayload | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [banners, setBanners] = useState<Banner[]>([]);
   const [groupOrder, setGroupOrder] = useState<string[]>([]);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>([]);
@@ -88,6 +90,13 @@ export default function App() {
         if (w) notify("warn", renderMsg(w));
       })
       .catch(() => {});
+
+    // Re-apply the persisted language choice once at mount: idempotent for
+    // i18next, but it also rebuilds the tray menu and window title from the
+    // backend's zh fallback into the user's actual language (A2/R4).
+    applyLanguage(savedLanguageChoice()).catch((e) =>
+      notify("warn", renderMsg(toMessage(e)))
+    );
 
     const unState = onStateChanged(({ id, state }) => {
       setTunnels((prev) => prev.map((t) => t.config.id === id ? { ...t, state } : t));
@@ -236,6 +245,9 @@ export default function App() {
           <button onClick={handleReconnectAll} style={btnSecondary}>
             {t("header.reconnectAll")}
           </button>
+          <button onClick={() => setShowSettings(true)} style={btnSecondary}>
+            ⚙ {t("header.settings")}
+          </button>
           <button onClick={() => { setEditTarget(null); setShowEditor(true); }} style={btnPrimary}>
             {t("header.add")}
           </button>
@@ -287,6 +299,10 @@ export default function App() {
           onClose={() => setPendingPassword(null)}
           onCancel={handlePasswordCancel}
         />
+      )}
+
+      {showSettings && (
+        <SettingsModal notify={notify} onClose={() => setShowSettings(false)} />
       )}
     </div>
   );

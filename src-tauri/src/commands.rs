@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -370,4 +370,52 @@ pub async fn delete_saved_password(
         }
     }
     Ok(())
+}
+
+// ─── Language UI support: tray rebuild / window title (G4) ───────────────────
+
+/// Labels for the tray menu and tooltip, supplied by the frontend in the
+/// user's language (D3: the backend never knows about languages). Menu item
+/// ids stay "show"/"reconnect"/"quit" — the event dispatch matches on ids.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayLabels {
+    pub show: String,
+    pub reconnect_all: String,
+    pub quit: String,
+    pub tooltip: String,
+}
+
+/// Replace the tray menu and tooltip in place (same tray icon, same event
+/// handlers). Tauri's set_menu/set_tooltip dispatch to the main thread, so
+/// no explicit run_on_main_thread is needed here.
+#[tauri::command]
+pub async fn rebuild_tray(labels: TrayLabels, app: tauri::AppHandle) -> Result<(), Msg> {
+    let tray = app.tray_by_id("main").ok_or(Msg::TrayMissing)?;
+    let menu =
+        crate::build_tray_menu(&app, &labels).map_err(|e| Msg::TrayUpdateFailed {
+            detail: e.to_string(),
+        })?;
+    tray.set_menu(Some(menu)).map_err(|e| Msg::TrayUpdateFailed {
+        detail: e.to_string(),
+    })?;
+    tray.set_tooltip(Some(labels.tooltip.as_str())).map_err(|e| {
+        Msg::TrayUpdateFailed {
+            detail: e.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+/// Set the main window title in the current language. The static title in
+/// tauri.conf.json ("portunnel") is only the pre-frontend fallback.
+#[tauri::command]
+pub async fn set_window_title(title: String, app: tauri::AppHandle) -> Result<(), Msg> {
+    use tauri::Manager;
+    let win = app
+        .get_webview_window("main")
+        .ok_or(Msg::MainWindowMissing)?;
+    win.set_title(&title).map_err(|e| Msg::SetTitleFailed {
+        detail: e.to_string(),
+    })
 }

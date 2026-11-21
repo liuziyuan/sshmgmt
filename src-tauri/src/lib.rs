@@ -85,6 +85,8 @@ pub fn run() {
             commands::set_group_order,
             commands::get_collapsed_groups,
             commands::set_collapsed_groups,
+            commands::rebuild_tray,
+            commands::set_window_title,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -132,23 +134,46 @@ fn migrate_hops(tunnels: &mut [TunnelConfig]) -> bool {
 
 // ─── 系统托盘 ──────────────────────────────────────────────────────────────────
 
-fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let reconnect_item = MenuItem::with_id(app, "reconnect", "全部重连", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+use commands::TrayLabels;
+use tauri::Wry;
 
-    let menu = Menu::with_items(app, &[&show_item, &reconnect_item, &sep, &quit_item])?;
+/// Build the tray menu from the given labels. Menu item ids are stable
+/// ("show"/"reconnect"/"quit") regardless of language — `on_menu_event`
+/// dispatches on ids, so language switches never touch event handling.
+/// Used both for the startup fallback (hardcoded zh, replaced by the
+/// frontend's applyLanguage moments after mount) and by rebuild_tray.
+pub(crate) fn build_tray_menu(
+    app: &tauri::AppHandle,
+    l: &TrayLabels,
+) -> tauri::Result<Menu<Wry>> {
+    let show_item = MenuItem::with_id(app, "show", &l.show, true, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", &l.reconnect_all, true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", &l.quit, true, None::<&str>)?;
+    Menu::with_items(app, &[&show_item, &reconnect_item, &sep, &quit_item])
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    // Startup fallback labels (zh). The frontend calls rebuild_tray with the
+    // user's language right after mount; English users may see zh for the
+    // first 1-2 seconds (adjudication A2/G4, risk R4).
+    let labels = TrayLabels {
+        show: "显示主窗口".into(),
+        reconnect_all: "全部重连".into(),
+        quit: "退出".into(),
+        tooltip: "SSH 隧道管理器".into(),
+    };
+    let menu = build_tray_menu(app.handle(), &labels)?;
 
     let icon = app
         .default_window_icon()
         .cloned()
         .ok_or(tauri::Error::InvalidWindowHandle)?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
-        .tooltip("SSH 隧道管理器")
+        .tooltip(&labels.tooltip)
         // 左键单击：切换窗口显示/隐藏
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {

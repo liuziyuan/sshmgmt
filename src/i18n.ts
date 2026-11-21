@@ -1,5 +1,6 @@
 import i18next, { type i18n as I18n } from "i18next";
 import { initReactI18next } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import zh from "./locales/zh.json";
 import en from "./locales/en.json";
 import type { LocalizedMessage } from "./types";
@@ -92,3 +93,30 @@ export function toMessage(e: unknown): LocalizedMessage {
 }
 
 export default i18next as I18n;
+
+/**
+ * Apply a language choice ("auto" re-resolves the system language), persist
+ * it, and sync the tray menu + window title via the rebuild commands (A2).
+ * Idempotent: applying the current choice is a no-op language-wise and just
+ * refreshes the tray/title. Storage failures degrade to an in-memory choice
+ * for this session. Invoke failures propagate to the caller — App and
+ * SettingsModal surface them as warn banners without blocking the switch.
+ */
+export async function applyLanguage(choice: LangChoice): Promise<void> {
+  try {
+    window.localStorage.setItem(LANG_STORAGE_KEY, choice);
+  } catch {
+    // ignore: session-only choice
+  }
+  await i18next.changeLanguage(choice === "auto" ? resolveLanguage() : choice);
+  const tooltip = i18next.t("app.windowTitle");
+  await invoke("set_window_title", { title: tooltip });
+  await invoke("rebuild_tray", {
+    labels: {
+      show: i18next.t("tray.show"),
+      reconnectAll: i18next.t("tray.reconnectAll"),
+      quit: i18next.t("tray.quit"),
+      tooltip,
+    },
+  });
+}

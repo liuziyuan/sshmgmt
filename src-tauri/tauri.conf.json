@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SSH 隧道管理器",
+        "title": "portunnel",
         "width": 1100,
         "height": 700,
         "minWidth": 900,
