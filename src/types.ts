@@ -171,7 +171,7 @@ export type TunnelState =
   | { type: "Connecting" }
   | { type: "Connected" }
   | { type: "Reconnecting" }
-  | { type: "Failed"; message: string }
+  | { type: "Failed"; message: LocalizedMessage }
   | { type: "PasswordRequired" };
 
 export interface TunnelInfo {

@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { submitPassword, listPublicKeys } from "../api";
 import type { PasswordRequiredPayload, PublicKeyInfo } from "../api";
 import type { Notify } from "../App";
+import { renderMsg, toMessage } from "../i18n";
 import { Overlay } from "./TunnelEditor";
 
 interface Props {
@@ -16,6 +18,7 @@ interface Props {
 }
 
 export default function PasswordModal({ request, notify, onClose, onCancel }: Props) {
+  const { t } = useTranslation();
   const { id, prompt, layer, host, needUsername, hopIndex, hopTotal } = request;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -58,8 +61,9 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
       );
       onClose();
     } catch (err) {
-      setError(String(err));
-      notify("error", `提交密码失败：${err}`);
+      const msg = renderMsg(toMessage(err));
+      setError(msg);
+      notify("error", t("pw.submitFailed", { detail: msg }));
       setSubmitting(false);
     }
   };
@@ -73,19 +77,19 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
 
   const multiHop = layer === "jump" && hopTotal !== undefined && hopTotal > 1;
   const title = layer === "target"
-    ? "🔐 目标主机登陆"
+    ? t("pw.targetTitle")
     : multiHop
-      ? `🔐 第 ${hopIndex}/${hopTotal} 跳 · ${host}`
-      : "🔐 需要密码";
-  const hostLabel = layer === "target" ? "内网目标主机" : "跳板机";
+      ? t("pw.hopTitle", { hopIndex, hopTotal, host })
+      : t("pw.needPwTitle");
+  const hostLabel = layer === "target" ? t("pw.targetHostLabel") : t("pw.jumpHostLabel");
 
   return (
     <Overlay onClose={onClose}>
       <div style={{ width: 400 }}>
         <h3 style={{ marginTop: 0, marginBottom: 4 }}>{title}</h3>
-        <p style={{ color: "#9ca3af", fontSize: 13, marginBottom: 4 }}>{prompt}</p>
+        <p style={{ color: "#9ca3af", fontSize: 13, marginBottom: 4 }}>{renderMsg(prompt)}</p>
         <p style={{ color: "#6b7280", fontSize: 12, marginBottom: 16 }}>
-          {hostLabel}：<code style={{ color: "#60a5fa" }}>{host}</code>
+          {hostLabel}<code style={{ color: "#60a5fa" }}>{host}</code>
         </p>
 
         <form onSubmit={handleSubmit}>
@@ -95,7 +99,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
               autoFocus
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="用户名"
+              placeholder={t("pw.usernamePlaceholder")}
               style={{ ...inputStyle, marginBottom: 10 }}
             />
           )}
@@ -104,7 +108,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
             autoFocus={!needUsername}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="输入密码"
+            placeholder={t("pw.passwordPlaceholder")}
             style={inputStyle}
           />
 
@@ -117,7 +121,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
               checked={save}
               onChange={(e) => setSave(e.target.checked)}
             />
-            记住密码（存入系统密钥链）
+            {t("pw.savePassword")}
           </label>
 
           <label style={{
@@ -132,7 +136,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
               disabled={!canUpload}
               onChange={(e) => setUpload(e.target.checked)}
             />
-            连接后上传公钥（下次免密）
+            {t("pw.uploadPubkey")}
           </label>
 
           {canUpload && upload && (
@@ -144,7 +148,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
               >
                 {keys.map((k) => (
                   <option key={k.path} value={k.path}>
-                    {k.name}{k.has_private ? "" : "（缺私钥，无法免密）"}
+                    {k.name}{k.has_private ? "" : t("pw.noPrivateKeySuffix")}
                   </option>
                 ))}
               </select>
@@ -165,7 +169,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
           )}
           {!canUpload && (
             <div style={{ color: "#6b7280", fontSize: 11, marginTop: 4 }}>
-              本机 ~/.ssh 下未找到任何 *.pub，无法上传公钥。
+              {t("pw.noPubkeyFound")}
             </div>
           )}
 
@@ -182,7 +186,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
                 border: "1px solid #374151", borderRadius: 6, cursor: "pointer", fontSize: 14,
               }}
             >
-              取消
+              {t("common.cancel")}
             </button>
             <button
               type="submit"
@@ -193,7 +197,7 @@ export default function PasswordModal({ request, notify, onClose, onCancel }: Pr
                 opacity: submitting || !password || (needUsername && !username.trim()) ? 0.6 : 1,
               }}
             >
-              {submitting ? "提交中…" : "确认"}
+              {submitting ? t("pw.submitting") : t("common.confirm")}
             </button>
           </div>
         </form>

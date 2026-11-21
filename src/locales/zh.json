@@ -39,6 +39,15 @@
     "state": "状态",
     "actions": "操作"
   },
+  "action": {
+    "connect": "连接",
+    "disconnect": "断开",
+    "reconnect": "重连",
+    "edit": "编辑",
+    "confirmDelete": "确认删除",
+    "cancel": "取消",
+    "delete": "删除"
+  },
   "list": {
     "empty": "暂无隧道。点击「新增隧道」粘贴 ssh 命令开始。",
     "noMatch": "没有匹配的隧道",

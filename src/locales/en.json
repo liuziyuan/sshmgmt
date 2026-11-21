@@ -39,6 +39,15 @@
     "state": "State",
     "actions": "Actions"
   },
+  "action": {
+    "connect": "Connect",
+    "disconnect": "Disconnect",
+    "reconnect": "Reconnect",
+    "edit": "Edit",
+    "confirmDelete": "Delete?",
+    "cancel": "Cancel",
+    "delete": "Delete"
+  },
   "list": {
     "empty": "No tunnels yet. Click \"Add tunnel\" and paste an ssh command to start.",
     "noMatch": "No matching tunnels",

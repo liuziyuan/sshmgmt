@@ -22,9 +22,12 @@ export interface EditorFormState {
 }
 
 // Field-located validation error so the UI can render per-field red hints.
+// `code` is a translation key under editor.validate.* — this module stays
+// i18n-free; the UI translates at render time (see TunnelEditor ErrorHints).
 export interface FormFieldError {
   field: string;
-  message: string;
+  code: string;
+  params?: Record<string, unknown>;
 }
 
 // Assembly never returns a half-broken command: invalid input yields
@@ -76,83 +79,84 @@ const FORBIDDEN_QUOTE_BACKSLASH_RE = /['"\\]/;
 // - identity path double quotes are part of that same ban.
 // Values are trimmed before checks; assembly trims the same way, so the
 // command is built from exactly the validated text.
+// Error codes are editor.validate.* keys; rule order is unchanged.
 export function validateFormState(s: EditorFormState): FormFieldError[] {
   const errors: FormFieldError[] = [];
 
   const jumpUser = s.jumpUser.trim();
   if (!jumpUser) {
-    errors.push({ field: "jumpUser", message: "用户名不能为空" });
+    errors.push({ field: "jumpUser", code: "editor.validate.usernameRequired" });
   } else if (/\s/.test(jumpUser)) {
-    errors.push({ field: "jumpUser", message: "用户名不能包含空格" });
+    errors.push({ field: "jumpUser", code: "editor.validate.usernameNoSpaces" });
   } else if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(jumpUser)) {
-    errors.push({ field: "jumpUser", message: "用户名不能包含引号或反斜杠字符" });
+    errors.push({ field: "jumpUser", code: "editor.validate.usernameForbiddenChars" });
   }
 
   const jumpHost = s.jumpHost.trim();
   if (!jumpHost) {
-    errors.push({ field: "jumpHost", message: "跳板机地址不能为空" });
+    errors.push({ field: "jumpHost", code: "editor.validate.jumpHostRequired" });
   } else {
     if (/\s/.test(jumpHost)) {
-      errors.push({ field: "jumpHost", message: "跳板机地址不能包含空格" });
+      errors.push({ field: "jumpHost", code: "editor.validate.jumpHostNoSpaces" });
     }
     if (jumpHost.includes("@")) {
-      errors.push({ field: "jumpHost", message: "跳板机地址不能包含 @" });
+      errors.push({ field: "jumpHost", code: "editor.validate.jumpHostNoAtSign" });
     }
     if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(jumpHost)) {
-      errors.push({ field: "jumpHost", message: "跳板机地址不能包含引号或反斜杠字符" });
+      errors.push({ field: "jumpHost", code: "editor.validate.jumpHostForbiddenChars" });
     }
     if (jumpHost.includes("[") || jumpHost.includes("]")) {
-      errors.push({ field: "jumpHost", message: "跳板机地址不能包含方括号，IPv6 直接填写裸地址即可" });
+      errors.push({ field: "jumpHost", code: "editor.validate.jumpHostNoBrackets" });
     }
   }
 
   if (parsePort(s.jumpPort.trim()) === null) {
-    errors.push({ field: "jumpPort", message: "端口必须是 1–65535 的数字" });
+    errors.push({ field: "jumpPort", code: "editor.validate.portRange" });
   }
 
   if (s.forwards.length === 0) {
-    errors.push({ field: "forwards", message: "至少需要一条转发规则" });
+    errors.push({ field: "forwards", code: "editor.validate.forwardsRequired" });
   }
 
   s.forwards.forEach((f, i) => {
     if (parsePort(f.localPort.trim()) === null) {
       errors.push({
         field: `forwards[${i}].localPort`,
-        message: "端口必须是 1–65535 的数字",
+        code: "editor.validate.portRange",
       });
     }
     const remoteHost = f.remoteHost.trim();
     if (!remoteHost) {
       errors.push({
         field: `forwards[${i}].remoteHost`,
-        message: "目标主机不能为空",
+        code: "editor.validate.remoteHostRequired",
       });
     } else if (/\s/.test(remoteHost)) {
       errors.push({
         field: `forwards[${i}].remoteHost`,
-        message: "目标主机不能包含空格",
+        code: "editor.validate.remoteHostNoSpaces",
       });
     } else if (remoteHost.includes(":")) {
       errors.push({
         field: `forwards[${i}].remoteHost`,
-        message: "目标主机暂不支持含冒号的地址（如裸 IPv6）",
+        code: "editor.validate.remoteHostNoColon",
       });
     } else if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(remoteHost)) {
       errors.push({
         field: `forwards[${i}].remoteHost`,
-        message: "目标主机不能包含引号或反斜杠字符",
+        code: "editor.validate.remoteHostForbiddenChars",
       });
     }
     if (parsePort(f.remotePort.trim()) === null) {
       errors.push({
         field: `forwards[${i}].remotePort`,
-        message: "端口必须是 1–65535 的数字",
+        code: "editor.validate.portRange",
       });
     }
   });
 
   if (FORBIDDEN_QUOTE_BACKSLASH_RE.test(s.identityFile)) {
-    errors.push({ field: "identityFile", message: "私钥路径不能包含引号或反斜杠字符" });
+    errors.push({ field: "identityFile", code: "editor.validate.identityFileForbiddenChars" });
   }
 
   return errors;
