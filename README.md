@@ -1,116 +1,118 @@
-# portunnel — SSH 隧道管理器
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-一个跨平台桌面应用，用来管理 SSH 本地端口转发（`ssh -L` 隧道）。把那些又长又难记的 `ssh -L 3306:db.internal:3306 user@jump` 命令存成一条条隧道，点一下就连，状态一眼可见，不用再在终端里手敲和盯着窗口。
+# portunnel — SSH Tunnel Manager
 
-基于 Tauri 2 + React + Rust（[russh](https://github.com/Eugeny/russh)）实现，原生小体积，无需本地装 `ssh` 客户端。
+A cross-platform desktop app for managing SSH local port forwarding (`ssh -L` tunnels). Save those long, easy-to-forget `ssh -L 3306:db.internal:3306 user@jump` commands as tunnels: one click to connect, status at a glance — no more typing them by hand in a terminal and babysitting windows.
 
-## 背景 / 它解决什么
+Built on Tauri 2 + React + Rust ([russh](https://github.com/Eugeny/russh)); small native footprint, no local `ssh` client required.
 
-平时连内网数据库、Redis、内部服务，常常要先开一条 SSH 跳板隧道。痛点：
+## Background / what it solves
 
-- 命令长、参数多，记不住也容易敲错；
-- 终端窗口一关隧道就断，得一直留着；
-- 同时开好几条，分不清哪条通哪条断；
-- 断线后要手动重连。
+Connecting to internal databases, Redis, or other services often requires an SSH jump-host tunnel first. Pain points:
 
-portunnel 把这些隧道集中管理：
+- Long commands, many flags — hard to remember and easy to mistype;
+- Closing the terminal window kills the tunnel;
+- Running several at once, unclear which are up and which are down;
+- Manual reconnect after a dropped connection.
 
-- **粘贴即用**：直接粘贴一条 `ssh -L ...` 命令，自动解析成隧道配置。
-- **一键连接 / 断开 / 重连**，每条隧道一个状态灯（🟢 已连接 / 🟠 连接中 / ⚪ 未连接 / 🔴 失败）。断开按钮在「连接中」黄灯阶段同样立即生效，不会卡死。
-- **自动重连**：断线按退避策略自动重试；跳板机连不上时最多 15 秒判定超时，不会无限黄灯。
-- **支持密码登录**：跳板机没配好公钥免密也能连——弹窗输入用户名密码即可（同时兼容仅开放 `keyboard-interactive` 的服务器，如企业 AD/Kerberos 环境）。密码可选择存入系统钥匙串，下次自动填充。
-- **连接后自动上传公钥**：密码登录成功后，勾选「连接后上传公钥」即可把本机公钥追加到服务器 `authorized_keys`，下次自动免密连接。
-- **二级目标主机登录校验**：如果某条转发的目标是另一台机器的 SSH 端口（如 `-L 10010:10.125.162.245:22`，通常是为了转发过去后再跳一次），连接时会顺带校验这台目标机的登录是否可行——优先尝试公钥（记住的用户名或从跳板机用户名推导），失败再弹密码框；只有两跳都验证通过才会显示绿灯。
-- **存活探测**：启动时自动探测本机端口，识别已经建立的隧道——**无论是本应用建的，还是你在别的终端里手动 `ssh -L` 起的**，都会如实显示为已连接。
-- **接管外部隧道**：你手动开的隧道一旦断掉，应用可自动接手重建，端口无缝衔接。
-- **分组 / 环境标签**：按项目、按 dev/staging/prod 归类。
-- **托盘常驻**：最小化到系统托盘后台保活，隧道不断。
-- **错误气泡不错过**：连接失败、认证失败、保存失败等错误会弹出常驻提示条，必须手动点 ✕ 才会消失；成功类提示则几秒后自动消失，多条可堆叠、互不覆盖。
+portunnel manages these tunnels in one place:
 
-> 🔑 首次连接如果跳板机 / 目标机还没配好公钥免密，会弹窗要求输入用户名密码；密码可选择记住，也可选择连接成功后自动把本机公钥上传上去，下次就不用再输了。
+- **Paste and go**: paste an `ssh -L ...` command and it is parsed into a tunnel config automatically.
+- **One-click connect / disconnect / reconnect**, with a status light per tunnel (🟢 connected / 🟠 connecting / ⚪ disconnected / 🔴 failed). The disconnect button also takes effect immediately during the yellow "connecting" phase — no getting stuck.
+- **Auto-reconnect**: dropped connections retry with backoff; an unreachable jump host is declared timed out after at most 15 seconds, so you never sit on an endless yellow light.
+- **Password login supported**: connect even without pubkey auth on the jump host — just enter the username and password in the prompt (also compatible with servers that only offer `keyboard-interactive`, e.g. corporate AD/Kerberos environments). Passwords can be stored in the system keychain and auto-filled next time.
+- **Automatic public-key upload after connect**: after a successful password login, check "Upload public key after connect" to append your local public key to the server's `authorized_keys` and go passwordless from then on.
+- **Second-layer target host login check**: if a forward targets another machine's SSH port (e.g. `-L 10010:10.125.162.245:22`, usually so you can hop again through it), the app verifies that the target host is actually loggable at connect time — pubkey first (remembered username or derived from the jump username), then a password prompt on failure; the light only turns green once both hops verify.
+- **Liveness probing**: on startup the app probes local ports and recognizes already-established tunnels — **whether created by this app or by a manual `ssh -L` in another terminal** — and honestly shows them as connected.
+- **Taking over external tunnels**: if a tunnel you started manually goes down, the app can rebuild it automatically with a seamless port handoff.
+- **Groups / environment tags**: organize by project and by dev/staging/prod.
+- **Tray-resident**: minimize to the system tray to keep tunnels alive in the background.
+- **Error notices you can't miss**: connection failures, auth failures, save failures and the like pop a persistent notice bar that only closes when you click ✕; success notices auto-dismiss after a few seconds. Multiple notices stack without overwriting each other.
 
-## 安装
+> 🔑 On first connect, if the jump host / target host doesn't have pubkey auth set up yet, a dialog asks for the username and password; you can choose to remember the password, and/or upload your public key after a successful connect so you never type it again.
 
-### 下载安装包
+## Installation
 
-到 [Releases](https://github.com/liuziyuan/portunnel/releases) 下载对应平台的包：
+### Download an installer
 
-| 平台 | 下载 |
+Grab the package for your platform from [Releases](https://github.com/liuziyuan/portunnel/releases):
+
+| Platform | Download |
 |------|------|
-| macOS（Apple Silicon，M 系列）| `portunnel_x.y.z_aarch64.dmg` |
-| macOS（Intel）| `portunnel_x.y.z_x64.dmg` |
+| macOS (Apple Silicon, M series) | `portunnel_x.y.z_aarch64.dmg` |
+| macOS (Intel) | `portunnel_x.y.z_x64.dmg` |
 | Windows | `portunnel_x.y.z_x64-setup.exe` / `.msi` |
-| Linux | `.AppImage` 或 `.deb` |
+| Linux | `.AppImage` or `.deb` |
 
-### 从旧版升级
+### Upgrading from the old version
 
-portunnel 由 sshmgmt 更名而来：升级后自动沿用原有隧道配置、分组与钥匙串密码，无需任何手动操作（首次启动自动迁移数据目录，旧数据保留不删除，可随时回滚旧版）。
+portunnel is a rename of sshmgmt: after upgrading, your existing tunnel configs, groups and keychain passwords carry over automatically — nothing to do by hand (the first launch migrates the data directory automatically; old data is kept, not deleted, so you can roll back to the old version anytime).
 
-如果你安装过旧版，建议安装 portunnel 后卸载旧版本：新旧并存期间两者配置各自独立、会各自分叉（钥匙串密码为二者共用）。
+If you had the old version installed, it's recommended to uninstall it after installing portunnel: while both are present their configs stay separate and will diverge (keychain passwords are shared between the two).
 
-不确定 Mac 芯片？终端执行 `uname -m`：`arm64` 选 aarch64，`x86_64` 选 Intel 包。
+Not sure which chip your Mac has? Run `uname -m` in a terminal: `arm64` → aarch64, `x86_64` → Intel package.
 
-### ⚠️ macOS 提示「"portunnel" 已损坏，无法打开，你应该将它移到废纸篓」
+### ⚠️ macOS says "portunnel" is damaged and can't be opened; you should move it to the Trash
 
-**这不是包真的损坏**。因为本应用尚未做 Apple 代码签名 / 公证，macOS Gatekeeper 会给下载的文件打上「隔离」标记并拦截未签名应用，从而误报「已损坏」。
+**The package is not actually damaged.** The app has no Apple code signing / notarization yet, so macOS Gatekeeper flags downloaded files with a "quarantine" attribute and blocks unsigned apps, producing this false "damaged" report.
 
-解决（把 app 拖进「应用程序」后，终端执行一次即可）：
+Fix (after dragging the app into "Applications", run this once in a terminal):
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/portunnel.app
 ```
 
-然后正常双击打开。之后不会再提示。
+Then open it normally by double-clicking. You won't be prompted again.
 
-> 想彻底免除此提示，需要 Apple 开发者证书（$99/年）对应用签名并公证。在那之前，请用上面的命令绕过。
+> To eliminate the prompt entirely, the app needs to be signed and notarized with an Apple developer certificate ($99/year). Until then, use the command above to bypass it.
 
-## 使用
+## Usage
 
-1. **新增隧道**：点右上角「+ 新增隧道」，把一条完整的 ssh 命令粘进去，例如
+1. **Add a tunnel**: click "+ Add tunnel" in the top right and paste a full ssh command, e.g.
    ```
    ssh -L 3306:db.internal:3306 -i ~/.ssh/id_ed25519 deploy@jump.example.com
    ```
-   应用会解析出监听端口、目标、跳板机等信息。可再填项目名、环境标签。
-2. **连接**：在列表对应行点「连接」，状态灯转绿即已通。若跳板机（或二级目标主机）需要密码，会弹窗要求输入；点「取消」会直接放弃本次连接并断开，而不是留着一个卡在黄灯的僵尸连接。
-3. **断开 / 重连**：用对应按钮；黄灯「连接中」阶段点断开同样立即生效；右上角「🔄 全部重连」适合切换网络 / VPN 后批量重连。
-4. **后台保活**：点最小化会隐藏到系统托盘，隧道保持连接；点托盘图标可重新唤出窗口；托盘右键菜单可「全部重连」或「退出」。
-5. **已存在的隧道**：如果某个端口已被你在终端里手动开的隧道占用，应用会自动识别并显示为已连接，不会冲突。
-6. **错误提示**：任何操作失败（连接、保存、删除、密码认证失败等）都会在顶部弹出红色常驻提示条，需手动点 ✕ 关闭，确保不会错过；成功类提示几秒后自动消失。
+   The app parses the listen port, target, jump host, and so on. You can also fill in a project name and environment tag.
+2. **Connect**: click "Connect" on the tunnel's row; the status light turns green when it's up. If the jump host (or the second-layer target host) needs a password, a dialog asks for it; clicking "Cancel" gives up on this connect attempt and disconnects immediately, rather than leaving a zombie stuck on yellow.
+3. **Disconnect / reconnect**: use the matching buttons; disconnecting during the yellow "connecting" phase also takes effect immediately; "🔄 Reconnect all" in the top right is handy for batch reconnects after switching networks / VPN.
+4. **Keep alive in the background**: minimizing hides the window to the system tray and keeps tunnels connected; click the tray icon to bring the window back; the tray menu offers "Reconnect all" and "Quit".
+5. **Pre-existing tunnels**: if a port is already occupied by a tunnel you started manually in a terminal, the app recognizes it and shows it as connected — no conflict.
+6. **Error notices**: any failed operation (connect, save, delete, password auth, etc.) pops a red persistent notice bar at the top, closed manually with ✕, so you never miss it; success notices auto-dismiss after a few seconds.
 
-### 退出行为说明
+### Exit behavior
 
-- **最小化 / 失焦** → 隐藏到托盘，**隧道继续运行**。
-- **托盘「退出」/ 关闭窗口 / Cmd+Q** → 进程结束，**应用内建立的隧道一并关闭**（在别的终端手动开的隧道不受影响）。
+- **Minimize / losing focus** → hides to the tray; **tunnels keep running**.
+- **Tray "Quit" / closing the window / Cmd+Q** → the process exits and **tunnels created inside the app close with it** (tunnels you started manually in other terminals are unaffected).
 
-## 从源码构建（开发者）
+## Building from source (developers)
 
-需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 环境依赖](https://tauri.app/start/prerequisites/)。
+Requires [Node.js](https://nodejs.org/), [Rust](https://www.rust-lang.org/tools/install) and the [Tauri prerequisites](https://tauri.app/start/prerequisites/).
 
 ```bash
-npm install          # 装前端依赖
-npm run tauri dev    # 开发模式（热重载）
-npm run tauri build  # 出当前平台的安装包，产物在 src-tauri/target/release/bundle/
+npm install          # install frontend dependencies
+npm run tauri dev    # development mode (hot reload)
+npm run tauri build  # build the installer for the current platform; output in src-tauri/target/release/bundle/
 ```
 
-发布：改 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 三处 `version`，提交后打 tag 推送：
+Releasing: bump `version` in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, commit, then tag and push:
 
 ```bash
 git tag v1.1.0 && git push origin v1.1.0
 ```
 
-GitHub Actions（`.github/workflows/release.yml`）会自动在 macOS / Windows / Linux 上构建并把安装包传到一个草稿 Release，确认后点 Publish 即可对外下载。
+GitHub Actions (`.github/workflows/release.yml`) builds on macOS / Windows / Linux automatically and uploads the installers to a draft Release; confirm it and click Publish to go public.
 
-## 技术栈
+## Tech stack
 
-- **前端**：React 19 + TypeScript + Vite
-- **后端**：Rust + Tokio + [russh](https://github.com/Eugeny/russh)（纯 Rust SSH 实现，无需系统 ssh）
-- **框架**：[Tauri 2](https://tauri.app/)
-- 密码 / 记住的目标主机用户名保存在系统钥匙串（Keychain / Credential Manager）。
+- **Frontend**: React 19 + TypeScript + Vite
+- **Backend**: Rust + Tokio + [russh](https://github.com/Eugeny/russh) (pure-Rust SSH implementation, no system ssh)
+- **Framework**: [Tauri 2](https://tauri.app/)
+- Passwords / remembered target-host usernames are stored in the system keychain (Keychain / Credential Manager).
 
-### 认证机制简述
+### How authentication works
 
-每次连接，跳板机认证分两阶段、各用独立的 SSH 连接：先只尝试本地私钥（`~/.ssh/id_ed25519` 等），失败后换一条全新连接再走密码 / keyboard-interactive。这样即使服务器 `MaxAuthTries` 很低，公钥重试也不会把密码认证的机会提前耗尽。目标是 `:22` 的转发同理，先尝试公钥（记住的用户名或从跳板机用户名推导），再退回密码提示。整个建连+认证过程可被「断开」随时打断，不会卡在黄灯。
+On every connect, jump-host authentication runs in two phases, each on its own SSH connection: first only local private keys are tried (`~/.ssh/id_ed25519` etc.); if that fails, a brand-new connection is used for password / keyboard-interactive. That way, even on servers with a low `MaxAuthTries`, the pubkey retries can't exhaust the password attempt's budget. Forwards targeting `:22` work the same way: pubkey first (remembered username or derived from the jump username), then a password prompt as fallback. The whole connect+authenticate process can be interrupted by "Disconnect" at any time, so you never stay stuck on yellow.
 
 ## License
 
-见 [LICENSE](./LICENSE)。
+See [LICENSE](./LICENSE).

@@ -201,7 +201,7 @@ export default function App() {
     );
   };
 
-  // User clicked ✕ / 取消 on the password prompt: give up on this login
+  // User clicked ✕ / Cancel on the password prompt: give up on this login
   // attempt entirely (disconnect the tunnel) rather than merely hiding the
   // modal — otherwise the backend keeps waiting on the prompt (up to 5 min)
   // and the tunnel is left stuck on yellow "Connecting" with no visible way

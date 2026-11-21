@@ -10,7 +10,7 @@ interface Props {
   request: PasswordRequiredPayload;
   notify: Notify;
   onClose: () => void;
-  /** User explicitly gave up on this login (✕ / 取消) — the tunnel connection
+  /** User explicitly gave up on this login (✕ / Cancel) — the tunnel connection
    * attempt should be aborted, not just the modal hidden (otherwise the
    * backend keeps waiting on this prompt up to its 5-minute timeout and the
    * tunnel stays stuck yellow "Connecting" with no way to tell it's dead). */
