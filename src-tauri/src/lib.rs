@@ -32,7 +32,7 @@ pub fn run() {
     // because both create the config dir and would defeat the three-state
     // legacy-dir check.
     if let Some(warning) = store::migrate_legacy_data_dir() {
-        tracing::warn!("legacy data dir migration: {}", warning);
+        tracing::warn!("legacy data dir migration: {:?}", warning);
         store::set_startup_warning(warning);
     }
 

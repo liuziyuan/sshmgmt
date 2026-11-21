@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::model::TunnelConfig;
+use crate::model::{Msg, TunnelConfig};
 
 const KEYRING_SERVICE: &str = "sshmgmt";
 
@@ -27,7 +27,7 @@ fn legacy_config_dir() -> PathBuf {
 /// One-shot legacy → new data-dir migration (spec C1).
 /// MUST run before any `create_dir_all(config_dir())`: an early write would
 /// create the new dir and the three-state check would never fire again (P1).
-pub fn migrate_legacy_data_dir() -> Option<String> {
+pub fn migrate_legacy_data_dir() -> Option<Msg> {
     // Derive the base from the legacy path so the migration source and the
     // live dir share one derivation (no hardcoded absolute paths, P9).
     let legacy_dir = legacy_config_dir();
@@ -39,8 +39,9 @@ pub fn migrate_legacy_data_dir() -> Option<String> {
 ///   new dir exists             -> None (use new dir; legacy untouched)
 ///   new missing, legacy exists -> copy the three JSON files (copy, NOT move)
 ///   both missing               -> None
-/// Any failure -> Some(warning message), keep going (empty-config startup).
-pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) -> Option<String> {
+/// Any failure -> Some(structured warning message), keep going (empty-config
+/// startup).
+pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) -> Option<Msg> {
     let new_dir = base.join(new_name);
     if new_dir.exists() {
         return None;
@@ -50,10 +51,10 @@ pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) ->
         return None;
     }
     if let Err(e) = std::fs::create_dir_all(&new_dir) {
-        return Some(format!(
-            "配置目录迁移失败，将以空配置启动（旧数据仍保留在 {}）：{e}",
-            legacy_dir.display()
-        ));
+        return Some(Msg::MigrationFailed {
+            legacy_dir: legacy_dir.display().to_string(),
+            detail: e.to_string(),
+        });
     }
     let mut failures = Vec::new();
     for file in MIGRATED_FILES {
@@ -69,24 +70,23 @@ pub(crate) fn migrate_between(base: &Path, legacy_name: &str, new_name: &str) ->
     if failures.is_empty() {
         None
     } else {
-        Some(format!(
-            "部分配置文件迁移失败，缺少的配置将以空内容启动。旧数据仍完整保留在 {}，可手动将其中的对应文件复制到新目录 {}。失败详情：{}",
-            legacy_dir.display(),
-            new_dir.display(),
-            failures.join("；")
-        ))
+        Some(Msg::MigrationPartialFailed {
+            legacy_dir: legacy_dir.display().to_string(),
+            new_dir: new_dir.display().to_string(),
+            failures,
+        })
     }
 }
 
-static STARTUP_WARNING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static STARTUP_WARNING: std::sync::OnceLock<Msg> = std::sync::OnceLock::new();
 
 /// Stash the migration warning for the frontend to pull on mount. First write
 /// wins; repeated sets are ignored.
-pub fn set_startup_warning(msg: String) {
+pub fn set_startup_warning(msg: Msg) {
     let _ = STARTUP_WARNING.set(msg);
 }
 
-pub fn startup_warning() -> Option<String> {
+pub fn startup_warning() -> Option<Msg> {
     STARTUP_WARNING.get().cloned()
 }
 
@@ -459,7 +459,13 @@ mod tests {
 
         let warning = migrate_between(&base, LEGACY_DIR_NAME, APP_DIR_NAME)
             .expect("partial failure must return a warning instead of panicking");
-        assert!(warning.contains("tunnels.json"), "warning was: {warning}");
+        match warning {
+            Msg::MigrationPartialFailed { failures, .. } => assert!(
+                failures.iter().any(|f| f.contains("tunnels.json")),
+                "failures were: {failures:?}"
+            ),
+            other => panic!("expected MigrationPartialFailed, got {other:?}"),
+        }
 
         // Best-effort: the other two files are still copied.
         let new_dir = base.join(APP_DIR_NAME);
