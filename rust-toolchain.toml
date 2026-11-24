@@ -1,2 +1,7 @@
 [toolchain]
 channel = "1.100.0"
+# Cross-compile targets used by the macOS release workflow. Declared here so
+# they are installed into the pinned toolchain (rust-toolchain.toml overrides
+# any `targets` input passed to dtolnay/rust-toolchain, which installs them
+# into the wrong toolchain instance).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
