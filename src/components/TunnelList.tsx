@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
-import type { TunnelInfo, TunnelState } from "../types";
+import { useTranslation } from "react-i18next";
+import { resolveHops, type TunnelInfo, type TunnelState } from "../types";
+import { renderMsg } from "../i18n";
 
 interface Props {
   tunnels: TunnelInfo[];
@@ -26,13 +28,9 @@ const STATE_COLOR: Record<string, string> = {
 // Coarse filter buckets shown as chips; finer states share a bucket.
 type StateFilter = "all" | "connected" | "connecting" | "failed" | "disconnected";
 
-const FILTER_LABEL: Record<StateFilter, string> = {
-  all: "全部",
-  connected: "已连接",
-  connecting: "连接中",
-  failed: "失败",
-  disconnected: "已断开",
-};
+// Labels resolve through i18n at render time so a language switch re-renders
+// them; the bucket keys themselves are stable identifiers.
+const FILTER_KEYS: StateFilter[] = ["all", "connected", "connecting", "failed", "disconnected"];
 
 const FILTER_COLOR: Record<StateFilter, string> = {
   all: "#9ca3af",
@@ -54,11 +52,14 @@ function bucketOf(state: TunnelState): StateFilter {
 }
 
 const UNGROUPED_KEY = "\u0000ungrouped";
-const UNGROUPED_LABEL = "未分组";
 
 function StateLight({ state }: { state: TunnelState }) {
+  const { t } = useTranslation();
   const color = STATE_COLOR[state.type] ?? "#374151";
-  const title = state.type === "Failed" ? `Failed: ${state.message}` : state.type;
+  const title =
+    state.type === "Failed"
+      ? t("state.failedTooltip", { reason: renderMsg(state.message) })
+      : t(`state.${state.type}`);
   return (
     <span title={title} style={{
       width: 10, height: 10, borderRadius: "50%",
@@ -88,9 +89,15 @@ function matchesQuery(t: TunnelInfo, q: string): boolean {
     // Search environments case-insensitively in both directions.
     t.config.environment?.toUpperCase(),
     t.config.jump_host,
-    ...t.config.forwards.map((f) => f.remote_host),
+    // Every hop in the chain is searchable (single-hop configs synthesize
+    // their hop from the legacy fields above, which stays as a fallback).
+    ...resolveHops(t.config).flatMap((h) => [h.host, h.user]),
     ...t.config.forwards.map((f) => String(f.local_port)),
-    ...t.config.forwards.map((f) => String(f.remote_port)),
+    // Dynamic rules carry ""/0 placeholders and Unknown kinds have unclear
+    // field semantics — only Local and Remote targets contribute.
+    ...t.config.forwards
+      .filter((f) => f.kind === "local" || f.kind === "remote")
+      .flatMap((f) => [f.remote_host, String(f.remote_port)]),
   ];
   return fields.some((s) => s && s.toLowerCase().includes(q));
 }
@@ -100,6 +107,7 @@ export default function TunnelList({
   collapsedGroups, onCollapsedChange,
   onConnect, onDisconnect, onReconnect, onEdit, onDelete,
 }: Props) {
+  const { t } = useTranslation();
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
@@ -176,7 +184,7 @@ export default function TunnelList({
     return (
       <div style={{ textAlign: "center", padding: "60px 0", color: "#6b7280" }}>
         <div style={{ fontSize: 40, marginBottom: 12 }}>🔌</div>
-        <div>暂无隧道。点击「新增隧道」粘贴 ssh 命令开始。</div>
+        <div>{t("list.empty")}</div>
       </div>
     );
   }
@@ -221,73 +229,107 @@ export default function TunnelList({
     onGroupOrderChange(keys.filter((k) => k !== UNGROUPED_KEY));
   };
 
-  const renderRow = (t: TunnelInfo) => (
-    <tr key={t.config.id} style={{ borderBottom: "1px solid #1f2937" }}>
+  const renderRow = (info: TunnelInfo) => {
+    const hops = resolveHops(info.config);
+    return (
+    <tr key={info.config.id} style={{ borderBottom: "1px solid #1f2937" }}>
       <td style={td}>
-        {t.config.group
-          ? <Tag label={t.config.group} color="#a78bfa" />
+        {info.config.group
+          ? <Tag label={info.config.group} color="#a78bfa" />
           : <span style={{ color: "#4b5563", fontSize: 12 }}>—</span>}
       </td>
       <td style={td}>
-        {t.config.environment
-          ? <Tag label={t.config.environment.toUpperCase()} color="#60a5fa" />
+        {info.config.environment
+          ? <Tag label={info.config.environment.toUpperCase()} color="#60a5fa" />
           : <span style={{ color: "#4b5563", fontSize: 12 }}>—</span>}
       </td>
-      <td style={td}>{t.config.name}</td>
+      <td style={td}>{info.config.name}</td>
       <td style={td}>
-        {t.config.forwards.map((f) => (
-          <div key={f.local_port} style={{ fontSize: 13 }}>
-            <span style={{ color: "#60a5fa" }}>:{f.local_port}</span>
+        {/* Keys are indices: a Remote rule's local_port is a server-side port
+            and may collide with another rule's local port. */}
+        {info.config.forwards.map((f, i) => (
+          <div key={i} style={{ fontSize: 13 }}>
+            {f.kind === "remote" ? (
+              <>
+                <span style={{ color: "#60a5fa" }}>
+                  {t("forward.remote", {
+                    bind: f.remote_bind ? `${f.remote_bind}:` : "",
+                    port: f.local_port,
+                  })}
+                </span>
+                {f.local_port === 0 && (
+                  <span style={{ color: "#9ca3af", fontSize: 11 }}>
+                    {t("forward.dynamicAlloc")}
+                  </span>
+                )}
+              </>
+            ) : f.kind === "local" || f.kind === "dynamic" ? (
+              <span style={{ color: "#60a5fa" }}>:{f.local_port}</span>
+            ) : (
+              <span title={t("forward.unknown")} style={{ color: "#6b7280" }}>—</span>
+            )}
           </div>
         ))}
       </td>
       <td style={td}>
-        {t.config.forwards.map((f) => (
-          <div key={f.local_port} style={{ fontSize: 12, color: "#d1d5db" }}>
-            {f.remote_host}:{f.remote_port}
+        {info.config.forwards.map((f, i) => (
+          <div key={i} style={{ fontSize: 12, color: "#d1d5db" }}>
+            {f.kind === "dynamic"
+              ? t("forward.socks")
+              : f.kind === "local" || f.kind === "remote"
+                ? `${f.remote_host}:${f.remote_port}`
+                : t("forward.unknown")}
           </div>
         ))}
       </td>
       <td style={td}>
         <span style={{ fontSize: 12 }}>
-          {t.config.jump_user}@{t.config.jump_host}
-          {t.config.jump_port !== 22 ? `:${t.config.jump_port}` : ""}
+          {hops.length > 0
+            ? hops.map((h, i) => (
+                <span key={i}>
+                  {i > 0 ? " → " : ""}
+                  {h.user}@{h.host}
+                  {h.port !== 22 ? `:${h.port}` : ""}
+                </span>
+              ))
+            : "—"}
         </span>
       </td>
       <td style={td}>
-        <StateLight state={t.state} />
+        <StateLight state={info.state} />
       </td>
       <td style={{ ...td, whiteSpace: "nowrap" }}>
-        {!isActive(t) ? (
-          <Btn onClick={() => onConnect(t.config.id)} color="#3b82f6">连接</Btn>
+        {!isActive(info) ? (
+          <Btn onClick={() => onConnect(info.config.id)} color="#3b82f6">{t("action.connect")}</Btn>
         ) : (
-          <Btn onClick={() => onDisconnect(t.config.id)} color="#6b7280">断开</Btn>
+          <Btn onClick={() => onDisconnect(info.config.id)} color="#6b7280">{t("action.disconnect")}</Btn>
         )}
-        <Btn onClick={() => onReconnect(t.config.id)} color="#f59e0b">重连</Btn>
-        <Btn onClick={() => onEdit(t)} color="#8b5cf6">编辑</Btn>
-        {confirmId === t.config.id ? (
+        <Btn onClick={() => onReconnect(info.config.id)} color="#f59e0b">{t("action.reconnect")}</Btn>
+        <Btn onClick={() => onEdit(info)} color="#8b5cf6">{t("action.edit")}</Btn>
+        {confirmId === info.config.id ? (
           <>
-            <Btn onClick={() => { onDelete(t.config.id); setConfirmId(null); }} color="#dc2626">确认删除</Btn>
-            <Btn onClick={() => setConfirmId(null)} color="#6b7280">取消</Btn>
+            <Btn onClick={() => { onDelete(info.config.id); setConfirmId(null); }} color="#dc2626">{t("action.confirmDelete")}</Btn>
+            <Btn onClick={() => setConfirmId(null)} color="#6b7280">{t("action.cancel")}</Btn>
           </>
         ) : (
-          <Btn onClick={() => setConfirmId(t.config.id)} color="#ef4444">删除</Btn>
+          <Btn onClick={() => setConfirmId(info.config.id)} color="#ef4444">{t("action.delete")}</Btn>
         )}
       </td>
     </tr>
-  );
+    );
+  };
 
   const tableHeader = (
     <thead>
       <tr style={{ borderBottom: "1px solid #374151", color: "#9ca3af", fontSize: 12 }}>
-        <th style={th}>项目</th>
-        <th style={th}>环境</th>
-        <th style={th}>名称</th>
-        <th style={th}>监听端口</th>
-        <th style={th}>目标</th>
-        <th style={th}>跳板机</th>
-        <th style={th}>状态</th>
-        <th style={th}>操作</th>
+        <th style={th}>{t("table.project")}</th>
+        <th style={th}>{t("table.environment")}</th>
+        <th style={th}>{t("table.name")}</th>
+        <th style={th}>{t("table.listenPort")}</th>
+        <th style={th}>{t("table.target")}</th>
+        <th style={th}>{t("table.jump")}</th>
+        <th style={th}>{t("table.state")}</th>
+        <th style={th}>{t("table.actions")}</th>
       </tr>
     </thead>
   );
@@ -302,7 +344,7 @@ export default function TunnelList({
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="搜索名称 / 项目 / 环境 / 主机 / 端口…"
+          placeholder={t("list.searchPlaceholder")}
           style={{
             flex: 1, minWidth: 220, maxWidth: 420, padding: "7px 12px",
             fontSize: 13, color: "#f9fafb", backgroundColor: "#1f2937",
@@ -310,7 +352,7 @@ export default function TunnelList({
           }}
         />
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {(Object.keys(FILTER_LABEL) as StateFilter[]).map((f) => (
+          {FILTER_KEYS.map((f) => (
             <button
               key={f}
               onClick={() => setStateFilter(f)}
@@ -322,31 +364,31 @@ export default function TunnelList({
                 border: `1px solid ${FILTER_COLOR[f]}66`,
               }}
             >
-              {FILTER_LABEL[f]}({counts[f]})
+              {t(`filter.${f}`)}({counts[f]})
             </button>
           ))}
           <button
             onClick={anyExpanded ? collapseAll : expandAll}
-            title={anyExpanded ? "收起所有分组" : "展开所有分组"}
+            title={anyExpanded ? t("list.collapseAllTitle") : t("list.expandAllTitle")}
             style={{
               padding: "4px 10px", fontSize: 12, borderRadius: 12,
               cursor: "pointer", color: "#9ca3af", backgroundColor: "transparent",
               border: "1px solid #374151",
             }}
           >
-            {anyExpanded ? "收起全部" : "展开全部"}
+            {anyExpanded ? t("list.collapseAll") : t("list.expandAll")}
           </button>
         </div>
       </div>
 
       {filtered.length === 0 ? (
         <div style={{ textAlign: "center", padding: "40px 0", color: "#6b7280" }}>
-          没有匹配的隧道
+          {t("list.noMatch")}
         </div>
       ) : (
         Array.from(groups.entries()).map(([key, items]) => {
           const isUngrouped = key === UNGROUPED_KEY;
-          const label = isUngrouped ? UNGROUPED_LABEL : key;
+          const label = isUngrouped ? t("list.ungrouped") : key;
           const connected = items.filter((t) => t.state.type === "Connected").length;
           const isCollapsed = !filtering && collapsed.has(key);
           const isDropTarget = dropKey === key && dragKey !== key && dragKey !== null;
@@ -378,7 +420,7 @@ export default function TunnelList({
                 }}
               >
                 <span
-                  title={canDrag ? "拖动调整分组顺序" : "搜索/筛选时不可拖动"}
+                  title={canDrag ? t("list.dragHint") : t("list.dragDisabledHint")}
                   draggable={canDrag}
                   onDragStart={(e) => {
                     if (!canDrag) return;
@@ -404,7 +446,7 @@ export default function TunnelList({
                   ? <span style={{ fontSize: 13, color: "#6b7280" }}>{label}</span>
                   : <Tag label={label} color="#a78bfa" />}
                 <span style={{ fontSize: 12, color: "#9ca3af" }}>
-                  {items.length} 条 · 已连接 {connected}
+                  {t("list.groupCount", { count: items.length, connected })}
                 </span>
               </div>
               {!isCollapsed && (

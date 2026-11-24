@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    sshmgmt_lib::run()
+    portunnel_lib::run()
 }

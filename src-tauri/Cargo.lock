@@ -3096,6 +3096,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "portunnel"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs 5.0.1",
+ "keyring",
+ "russh",
+ "russh-keys",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4075,29 +4098,6 @@ dependencies = [
  "ssh-encoding",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "sshmgmt"
-version = "1.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "dirs 5.0.1",
- "keyring",
- "russh",
- "russh-keys",
- "serde",
- "serde_json",
- "shell-words",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

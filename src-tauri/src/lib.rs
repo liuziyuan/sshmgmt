@@ -3,6 +3,7 @@ mod manager;
 mod model;
 mod parser;
 mod probe;
+pub(crate) mod socks;
 mod store;
 mod transfer;
 mod tunnel;
@@ -23,12 +24,25 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sshmgmt=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("portunnel=debug")),
         )
         .init();
 
+    // Earliest possible point: must precede load_tunnels() and any save_*(),
+    // because both create the config dir and would defeat the three-state
+    // legacy-dir check.
+    if let Some(warning) = store::migrate_legacy_data_dir() {
+        tracing::warn!("legacy data dir migration: {:?}", warning);
+        store::set_startup_warning(warning);
+    }
+
     let mut tunnels = load_tunnels();
     migrate_env_case(&mut tunnels);
+    if migrate_hops(&mut tunnels) {
+        if let Err(e) = store::save_tunnels(&tunnels) {
+            tracing::warn!("hops migration failed: {}", e);
+        }
+    }
     let manager = TunnelManager::new(tunnels);
 
     tauri::Builder::default()
@@ -53,6 +67,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_tunnels,
+            commands::get_startup_warning,
             commands::parse_command,
             commands::add_tunnel,
             commands::update_tunnel,
@@ -70,6 +85,8 @@ pub fn run() {
             commands::set_group_order,
             commands::get_collapsed_groups,
             commands::set_collapsed_groups,
+            commands::rebuild_tray,
+            commands::set_window_title,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -102,25 +119,61 @@ fn migrate_env_case(tunnels: &mut Vec<TunnelConfig>) {
     }
 }
 
+// One-time migration: give configs written before the `hops` field existed an
+// explicit hop chain (and repair a drifted legacy mirror). Idempotent via
+// `ensure_hops`, so the file is rewritten only when something changed.
+fn migrate_hops(tunnels: &mut [TunnelConfig]) -> bool {
+    let mut changed = false;
+    for c in tunnels.iter_mut() {
+        if c.ensure_hops() {
+            changed = true;
+        }
+    }
+    changed
+}
+
 // ─── 系统托盘 ──────────────────────────────────────────────────────────────────
 
-fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-    let reconnect_item = MenuItem::with_id(app, "reconnect", "全部重连", true, None::<&str>)?;
-    let sep = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+use commands::TrayLabels;
+use tauri::Wry;
 
-    let menu = Menu::with_items(app, &[&show_item, &reconnect_item, &sep, &quit_item])?;
+/// Build the tray menu from the given labels. Menu item ids are stable
+/// ("show"/"reconnect"/"quit") regardless of language — `on_menu_event`
+/// dispatches on ids, so language switches never touch event handling.
+/// Used both for the startup fallback (hardcoded zh, replaced by the
+/// frontend's applyLanguage moments after mount) and by rebuild_tray.
+pub(crate) fn build_tray_menu(
+    app: &tauri::AppHandle,
+    l: &TrayLabels,
+) -> tauri::Result<Menu<Wry>> {
+    let show_item = MenuItem::with_id(app, "show", &l.show, true, None::<&str>)?;
+    let reconnect_item = MenuItem::with_id(app, "reconnect", &l.reconnect_all, true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", &l.quit, true, None::<&str>)?;
+    Menu::with_items(app, &[&show_item, &reconnect_item, &sep, &quit_item])
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    // Startup fallback labels (zh). The frontend calls rebuild_tray with the
+    // user's language right after mount; English users may see zh for the
+    // first 1-2 seconds (adjudication A2/G4, risk R4).
+    let labels = TrayLabels {
+        show: "显示主窗口".into(),
+        reconnect_all: "全部重连".into(),
+        quit: "退出".into(),
+        tooltip: "SSH 隧道管理器".into(),
+    };
+    let menu = build_tray_menu(app.handle(), &labels)?;
 
     let icon = app
         .default_window_icon()
         .cloned()
         .ok_or(tauri::Error::InvalidWindowHandle)?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
-        .tooltip("SSH 隧道管理器")
+        .tooltip(&labels.tooltip)
         // 左键单击：切换窗口显示/隐藏
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -184,4 +237,54 @@ fn intercept_minimize(app: &tauri::App) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{ForwardKind, ForwardSpec, Hop};
+
+    /// A config as written by v1.4 and earlier: no `hops`, legacy fields only.
+    fn legacy_config(id: &str) -> TunnelConfig {
+        TunnelConfig {
+            id: id.to_string(),
+            name: "t".into(),
+            raw_command: "ssh -L 1:h:2 jump".into(),
+            jump_user: "u".into(),
+            jump_host: "jump".into(),
+            jump_port: 2222,
+            hops: Vec::new(),
+            forwards: vec![ForwardSpec {
+                local_port: 1,
+                remote_host: "h".into(),
+                remote_port: 2,
+                kind: ForwardKind::Local,
+                remote_bind: None,
+            }],
+            bind_all: false,
+            identity_file: None,
+            auto_reconnect: true,
+            group: None,
+            environment: None,
+        }
+    }
+
+    #[test]
+    fn migrate_hops_builds_single_hop_from_legacy() {
+        let mut tunnels = vec![legacy_config("a")];
+
+        assert!(migrate_hops(&mut tunnels));
+        assert_eq!(
+            tunnels[0].hops,
+            vec![Hop { user: "u".into(), host: "jump".into(), port: 2222 }]
+        );
+    }
+
+    #[test]
+    fn migrate_hops_idempotent_second_run_false() {
+        let mut tunnels = vec![legacy_config("a")];
+
+        assert!(migrate_hops(&mut tunnels));
+        assert!(!migrate_hops(&mut tunnels));
+    }
 }

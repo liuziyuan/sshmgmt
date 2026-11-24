@@ -44,16 +44,25 @@ pub async fn probe_port(port: u16) -> PortStatus {
 
 /// Aggregate probe over all forwards of a tunnel.
 ///
-/// If any port is Free we treat the whole tunnel as bindable (Free) and let the
-/// normal start path run. Otherwise, all-Working → Working, else Broken.
+/// Only rules with a local listener (Local/Dynamic) are probed: Remote rules
+/// listen on the server, not here, so they can neither be probed nor mistaken
+/// for an externally managed tunnel (B5). If any port is Free we treat the
+/// whole tunnel as bindable (Free) and let the normal start path run.
+/// Otherwise, all-Working → Working, else Broken.
 pub async fn probe_forwards(forwards: &[ForwardSpec]) -> PortStatus {
-    if forwards.is_empty() {
+    let local: Vec<&ForwardSpec> = forwards
+        .iter()
+        .filter(|f| f.has_local_listener())
+        .collect();
+    if local.is_empty() {
+        // Nothing on this machine to probe (all Remote/Unknown) — never block
+        // the app from starting the tunnel and never mark it external.
         return PortStatus::Free;
     }
 
     let mut all_working = true;
-    for f in forwards {
-        match probe_port(f.local_port).await {
+    for f in local {
+        match probe_port(f.listen_port()).await {
             PortStatus::Free => return PortStatus::Free,
             PortStatus::Working => {}
             PortStatus::Broken => all_working = false,
@@ -65,6 +74,17 @@ pub async fn probe_forwards(forwards: &[ForwardSpec]) -> PortStatus {
     } else {
         PortStatus::Broken
     }
+}
+
+/// Local ports owned by the given rules. Used before killing whatever holds a
+/// "broken" port — a Remote rule's port lives on the server and must never be
+/// killed locally (B5).
+pub fn local_listen_ports(forwards: &[ForwardSpec]) -> Vec<u16> {
+    forwards
+        .iter()
+        .filter(|f| f.has_local_listener())
+        .map(|f| f.listen_port())
+        .collect()
 }
 
 /// Kill the process(es) currently listening on `port` (macOS `lsof`).
@@ -94,5 +114,52 @@ pub fn kill_port_listeners(port: u16) {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ForwardKind;
+
+    fn spec(kind: ForwardKind, port: u16) -> ForwardSpec {
+        ForwardSpec {
+            local_port: port,
+            remote_host: "host".into(),
+            remote_port: 2,
+            kind,
+            remote_bind: None,
+        }
+    }
+
+    /// A tunnel made only of Remote rules has nothing local to probe: it is
+    /// always Free (never marked external, never blocked from starting).
+    #[tokio::test]
+    async fn probe_forwards_all_remote_is_free() {
+        let forwards = [
+            spec(ForwardKind::Remote, 8080),
+            spec(ForwardKind::Unknown("socks-udp".into()), 9090),
+        ];
+        assert_eq!(probe_forwards(&forwards).await, PortStatus::Free);
+    }
+
+    #[tokio::test]
+    async fn probe_forwards_empty_is_free() {
+        assert_eq!(probe_forwards(&[]).await, PortStatus::Free);
+    }
+
+    #[test]
+    fn local_listen_ports_matrix() {
+        let forwards = [
+            spec(ForwardKind::Local, 10001),
+            spec(ForwardKind::Remote, 8080),
+            spec(ForwardKind::Dynamic, 1080),
+            spec(ForwardKind::Unknown("socks-udp".into()), 9090),
+        ];
+        assert_eq!(local_listen_ports(&forwards), vec![10001, 1080]);
+
+        let all_remote = [spec(ForwardKind::Remote, 8080)];
+        assert!(local_listen_ports(&all_remote).is_empty());
+        assert!(local_listen_ports(&[]).is_empty());
     }
 }

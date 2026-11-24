@@ -6,10 +6,9 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::TunnelConfig;
+use crate::model::{Msg, TunnelConfig};
 use crate::store;
 
 pub const EXPORT_FORMAT: &str = "sshmgmt-tunnels";
@@ -21,6 +20,11 @@ pub const EXPORT_VERSION: u32 = 1;
 pub struct TunnelSecret {
     pub password: Option<String>,
     pub target_user: Option<String>,
+    /// Per-hop passwords in hop order (index-aligned with `config.hops`).
+    /// Absent in older export files → empty list; the legacy `password` field
+    /// still carries the first hop's password for those files.
+    #[serde(default)]
+    pub hop_passwords: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,12 +56,28 @@ pub fn build_export(tunnels: &[TunnelConfig]) -> ExportFile {
         .unwrap_or(0);
     let tunnels = tunnels
         .iter()
-        .map(|c| ExportedTunnel {
-            secret: TunnelSecret {
-                password: store::get_password(&c.jump_user, &c.jump_host, c.jump_port),
-                target_user: store::get_target_user(&c.jump_host, c.jump_port),
-            },
-            config: c.clone(),
+        .map(|c| {
+            let hops = c.resolved_hops();
+            let hop_passwords = hops
+                .iter()
+                .map(|h| store::get_password(&h.user, &h.host, h.port))
+                .collect();
+            // Legacy field: the first hop's password, so a v1.4 importer still
+            // gets the entry-hop credential.
+            let password = hops
+                .first()
+                .and_then(|h| store::get_password(&h.user, &h.host, h.port));
+            let target_user = c
+                .first_hop()
+                .and_then(|h| store::get_target_user(&h.host, h.port));
+            ExportedTunnel {
+                secret: TunnelSecret {
+                    password,
+                    target_user,
+                    hop_passwords,
+                },
+                config: c.clone(),
+            }
         })
         .collect();
     ExportFile {
@@ -73,40 +93,45 @@ pub fn build_export(tunnels: &[TunnelConfig]) -> ExportFile {
 }
 
 /// Serialize and write the export file (pretty JSON so users can inspect it).
-pub fn write_export(path: &Path, file: &ExportFile) -> Result<()> {
-    let data = serde_json::to_string_pretty(file).context("Failed to serialize export")?;
-    std::fs::write(path, data)
-        .with_context(|| format!("Failed to write export file {:?}", path))?;
+pub fn write_export(path: &Path, file: &ExportFile) -> Result<(), Msg> {
+    let data = serde_json::to_string_pretty(file).map_err(|e| Msg::ExportSerializeFailed {
+        detail: e.to_string(),
+    })?;
+    std::fs::write(path, data).map_err(|e| Msg::ExportWriteFailed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
     Ok(())
 }
 
 /// Read and validate an import file. Rejects unknown formats, versions newer
 /// than what this build understands, and entries with empty id/name.
-pub fn read_import(path: &Path) -> Result<ExportFile> {
-    let data = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read import file {:?}", path))?;
-    let file: ExportFile =
-        serde_json::from_str(&data).context("Import file is not valid JSON")?;
+pub fn read_import(path: &Path) -> Result<ExportFile, Msg> {
+    let data = std::fs::read_to_string(path).map_err(|e| Msg::ImportReadFailed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let file: ExportFile = serde_json::from_str(&data).map_err(|e| Msg::ImportInvalidJson {
+        detail: e.to_string(),
+    })?;
     if file.format != EXPORT_FORMAT {
-        bail!(
-            "Unknown export format {:?} (expected {:?})",
-            file.format,
-            EXPORT_FORMAT
-        );
+        return Err(Msg::ImportUnknownFormat {
+            format: file.format,
+            expected: EXPORT_FORMAT.to_string(),
+        });
     }
     if file.version > EXPORT_VERSION {
-        bail!(
-            "Unsupported export file version {} (this build supports up to {})",
-            file.version,
-            EXPORT_VERSION
-        );
+        return Err(Msg::ImportUnsupportedVersion {
+            version: file.version,
+            max_version: EXPORT_VERSION,
+        });
     }
     for t in &file.tunnels {
         if t.config.id.trim().is_empty() {
-            bail!("Import file contains a tunnel with an empty id");
+            return Err(Msg::ImportEmptyId);
         }
         if t.config.name.trim().is_empty() {
-            bail!("Import file contains a tunnel with an empty name");
+            return Err(Msg::ImportEmptyName);
         }
     }
     Ok(file)
@@ -140,7 +165,7 @@ pub fn split_new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ForwardSpec;
+    use crate::model::{ForwardKind, ForwardSpec, Hop};
 
     fn config(id: &str, name: &str) -> TunnelConfig {
         TunnelConfig {
@@ -150,10 +175,13 @@ mod tests {
             jump_user: "user".into(),
             jump_host: "jump".into(),
             jump_port: 22,
+            hops: vec![Hop { user: "user".into(), host: "jump".into(), port: 22 }],
             forwards: vec![ForwardSpec {
                 local_port: 5432,
                 remote_host: "db".into(),
                 remote_port: 5432,
+                kind: ForwardKind::Local,
+                remote_bind: None,
             }],
             bind_all: false,
             identity_file: None,
@@ -247,7 +275,7 @@ mod tests {
 
     #[test]
     fn read_import_rejects_wrong_format() {
-        let dir = std::env::temp_dir().join("sshmgmt-transfer-tests");
+        let dir = std::env::temp_dir().join("portunnel-transfer-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wrong-format.json");
         std::fs::write(
@@ -260,7 +288,7 @@ mod tests {
 
     #[test]
     fn read_import_rejects_future_version() {
-        let dir = std::env::temp_dir().join("sshmgmt-transfer-tests");
+        let dir = std::env::temp_dir().join("portunnel-transfer-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("future-version.json");
         std::fs::write(
@@ -269,5 +297,51 @@ mod tests {
         )
         .unwrap();
         assert!(read_import(&path).is_err());
+    }
+
+    // ─── per-hop secrets (C5 / export-import) ───────────────────────────────
+
+    #[test]
+    fn secret_hop_passwords_default_empty_and_roundtrip() {
+        assert!(TunnelSecret::default().hop_passwords.is_empty());
+
+        let secret = TunnelSecret {
+            password: Some("p1".into()),
+            target_user: None,
+            hop_passwords: vec![Some("p1".into()), None],
+        };
+        let back: TunnelSecret =
+            serde_json::from_str(&serde_json::to_string(&secret).unwrap()).unwrap();
+        assert_eq!(
+            back.hop_passwords,
+            vec![Some("p1".to_string()), None]
+        );
+        assert_eq!(back.password.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn legacy_export_without_hop_passwords_parses() {
+        let secret: TunnelSecret =
+            serde_json::from_str(r#"{"password":"p","target_user":"u"}"#).unwrap();
+        assert_eq!(secret.password.as_deref(), Some("p"));
+        assert_eq!(secret.target_user.as_deref(), Some("u"));
+        assert!(secret.hop_passwords.is_empty());
+    }
+
+    #[test]
+    fn multi_hop_export_keeps_hops_order() {
+        // Structural assertion only — building an export reads the keychain.
+        let secret = TunnelSecret {
+            password: Some("first".into()),
+            target_user: None,
+            hop_passwords: vec![Some("first".into()), Some("second".into())],
+        };
+        let value = serde_json::to_value(&secret).unwrap();
+
+        assert_eq!(value["password"], "first");
+        let passwords = value["hop_passwords"].as_array().unwrap();
+        assert_eq!(passwords.len(), 2);
+        assert_eq!(passwords[0], "first");
+        assert_eq!(passwords[1], "second");
     }
 }

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-面向在本仓库（sshmgmt）工作的 AI 编码助手的项目说明。
+面向在本仓库（portunnel）工作的 AI 编码助手的项目说明。
 
 ## 项目是什么
 
@@ -26,7 +26,7 @@ src-tauri/src/               后端（Rust）
   tunnel.rs                   核心：连接、两阶段认证、端口转发、断线重连的状态机（见下方"认证与连接状态机"）
   parser.rs                   把一条 `ssh ...` 命令行解析成 TunnelConfig（不支持 -J，只支持单跳 -L）
   model.rs                    Rust 侧数据结构（TunnelConfig/TunnelState/...），需与 src/types.ts 手动保持一致
-  store.rs                    本地持久化（~/.config/sshmgmt/tunnels.json）+ 系统钥匙串读写（密码、记住的目标主机用户名）
+  store.rs                    本地持久化（Linux `~/.config/portunnel/`、macOS `~/Library/Application Support/portunnel/`、Windows `%APPDATA%\portunnel/`；启动时一次性从旧版数据目录复制迁移，旧目录保留）+ 系统钥匙串读写（密码、记住的目标主机用户名）
   probe.rs                    探测本机端口是否已被（本应用或外部）健康的隧道占用
 ```
 
@@ -74,7 +74,7 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 3. `src-tauri/Cargo.toml` 的 `version = "..."`
 4. `src-tauri/tauri.conf.json` 的 `"version": "..."`
 
-改完 `Cargo.toml` 后跑一次 `cargo build`，让 `Cargo.lock` 里 `name = "sshmgmt"` 对应的 `version` 自动同步。
+改完 `Cargo.toml` 后跑一次 `cargo build`，让 `Cargo.lock` 里 `name = "portunnel"` 对应的 `version` 自动同步。
 
 ### 完整发布流程（按顺序，最后一步不能省）
 
@@ -84,11 +84,11 @@ cargo clippy --lib       # lint（manager.rs/parser.rs 有几条历史遗留的�
 4. 本地 `git checkout main && git pull`，确认 `main` 已包含合并后的提交。
 5. **`git tag vX.Y.Z && git push origin vX.Y.Z`** ← 真正触发发布的唯一步骤，tag 版本号要和第 1 步的 4 处版本号一致。
 6. GitHub Actions 在 macOS（arm64 + x64）/ Windows / Linux 上构建，产物自动进一个**草稿** Release（`gh run view <run-id>` 或 Actions 页面看进度）。
-7. 人工去 [Releases 页面](https://github.com/liuziyuan/sshmgmt/releases) 确认草稿内容后点 **Publish**，才算真正对外发布。workflow 不会自动帮你点这一步。
+7. 人工去 [Releases 页面](https://github.com/liuziyuan/portunnel/releases) 确认草稿内容后点 **Publish**，才算真正对外发布。workflow 不会自动帮你点这一步。
 
 ## 其他约定
 
-- **UI 文案一律中文**（用户群体是中文使用者），代码注释可用英文（仓库历史注释以英文为主，新增代码请保持这个风格：注释英文、UI 字符串中文）。
+- **UI 文案经 i18n（react-i18next）**：全部用户可见文案进 `src/locales/zh.json` / `en.json`（zh 为默认与回退语言），组件用 `useTranslation().t`、事件回调等非渲染路径用 `i18n.t` 实例调用；后端不产出任何用户可见文本，只构造 `Msg` 消息码 + 插值参数（`model.rs` ↔ `types.ts` 双侧同步），由 locales 的 `msg.*` 区翻译，改 `Msg` 变体记得三处同步（model.rs / types.ts / locales msg.*，`npm run check:i18n` 校验）。代码注释用英文（仓库历史注释以英文为主，新增代码保持这个风格）。
 - `src/types.ts` 的 `TunnelState`/`TunnelConfig` 等类型需要和 `src-tauri/src/model.rs` 手动保持字段一致，改一边记得改另一边。
 - `store.rs` 里钥匙串账号命名有约定：密码用 `user@host:port`，记住的目标主机用户名用保留前缀 `__targetuser__@host:port` 区分，避免和真实用户名冲突。新增钥匙串条目类型时沿用"保留前缀"这个模式。
 - `parser.rs` 目前只支持单跳 `-L`，明确不支持 `-J`（ProxyJump）；如果要支持多跳，需要同时评估 `tunnel.rs` 里 `direct-tcpip` 转发路径的改动量。

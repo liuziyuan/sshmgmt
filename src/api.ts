@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import type { TunnelConfig, TunnelInfo, TunnelState } from "./types";
+import i18n from "./i18n";
+import type { LocalizedMessage, TunnelConfig, TunnelInfo, TunnelState } from "./types";
 
 // ─── Queries ─────────────────────────────────────────────────────────────────
 
@@ -9,6 +10,10 @@ export const listTunnels = (): Promise<TunnelInfo[]> => invoke("list_tunnels");
 
 export const parseCommand = (raw: string): Promise<TunnelConfig> =>
   invoke("parse_command", { raw });
+
+/** Structured startup-migration warning produced at backend init, if any. */
+export const getStartupWarning = (): Promise<LocalizedMessage | null> =>
+  invoke("get_startup_warning");
 
 // ─── CRUD ─────────────────────────────────────────────────────────────────────
 
@@ -68,7 +73,7 @@ export interface ImportSummary {
   imported: number;
   skipped: number;
   skipped_names: string[];
-  warnings: string[];
+  warnings: LocalizedMessage[];
 }
 
 export const exportTunnels = (path: string): Promise<number> =>
@@ -80,8 +85,13 @@ export const importTunnels = (path: string): Promise<ImportSummary> =>
 /** Native save dialog for the export file; returns null when cancelled. */
 export const pickExportPath = (): Promise<string | null> =>
   save({
-    defaultPath: "tunnels.sshmgmt.json",
-    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+    defaultPath: "tunnels.portunnel.json",
+    filters: [
+      {
+        name: i18n.t("dialog.tunnelFilter"),
+        extensions: ["portunnel.json", "sshmgmt.json", "json"],
+      },
+    ],
   });
 
 /** Native open dialog for an import file; single selection, null when cancelled. */
@@ -89,7 +99,12 @@ export const pickImportPath = (): Promise<string | null> =>
   open({
     multiple: false,
     directory: false,
-    filters: [{ name: "SSH 隧道配置", extensions: ["sshmgmt.json", "json"] }],
+    filters: [
+      {
+        name: i18n.t("dialog.tunnelFilter"),
+        extensions: ["portunnel.json", "sshmgmt.json", "json"],
+      },
+    ],
   }) as Promise<string | null>;
 
 // ─── Group ordering ──────────────────────────────────────────────────────────
@@ -116,10 +131,15 @@ export const onStateChanged = (
 
 export interface PasswordRequiredPayload {
   id: string;
-  prompt: string;
+  /** Structured prompt message; rendered by the frontend in its language. */
+  prompt: LocalizedMessage;
   layer: "jump" | "target";
   host: string;
   needUsername: boolean;
+  /** 1-based hop number; present only for multi-hop "jump" prompts. */
+  hopIndex?: number;
+  /** Total hops in the chain; present only for multi-hop "jump" prompts. */
+  hopTotal?: number;
 }
 
 export const onPasswordRequired = (
@@ -132,7 +152,7 @@ export const onPasswordRequired = (
 export interface NoticePayload {
   id: string;
   level: "success" | "warn" | "error";
-  message: string;
+  message: LocalizedMessage;
 }
 
 export const onNotice = (
